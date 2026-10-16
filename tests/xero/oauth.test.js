@@ -46,8 +46,9 @@ describe("authorize URL", () => {
     expect(url.searchParams.get("state")).toBe("abc");
     expect(url.searchParams.get("response_type")).toBe("code");
     const scopes = url.searchParams.get("scope").split(" ");
-    expect(scopes).toEqual(
-      expect.arrayContaining(["offline_access", "accounting.contacts", "accounting.transactions", "accounting.settings"])
+    // Granular scopes only — Xero no longer issues accounting.transactions to new apps.
+    expect(scopes.sort()).toEqual(
+      ["accounting.contacts", "accounting.invoices", "accounting.payments", "accounting.settings.read", "offline_access"]
     );
   });
 });

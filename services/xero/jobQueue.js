@@ -14,6 +14,9 @@ const { logSync } = require("./syncLog");
 const sync = require("./syncService");
 const xero = require("./client");
 const connectionRequests = require("./connectionRequestService");
+const cleanup = require("./connectionCleanup");
+
+const OFFBOARD_SWEEP_MS = 60 * 60 * 1000;
 
 const POLL_MS = 15 * 1000;
 const LOCK_TIMEOUT_MS = 15 * 60 * 1000;
@@ -145,6 +148,7 @@ const startXeroWorker = () => {
     try {
       await recoverStale();
       await connectionRequests.expireDue();
+      await cleanup.releaseAbandonedSignups();
       for (let i = 0; i < 20 && (await processNext()); i += 1);
     } catch (err) {
       console.error("[xero] worker error:", err.message);
@@ -156,6 +160,11 @@ const startXeroWorker = () => {
   setInterval(
     () => scheduleIncrementalSyncs().catch((e) => console.error("[xero] schedule error:", e.message)),
     getConfig().syncIntervalMs
+  ).unref();
+  // Customers who off-board (account deactivated, subscription ended) are disconnected.
+  setInterval(
+    () => cleanup.disconnectOffboarded(xero.disconnect).catch((e) => console.error("[xero] off-boarding sweep error:", e.message)),
+    OFFBOARD_SWEEP_MS
   ).unref();
   console.log("[xero] background worker started");
 };

@@ -11,7 +11,9 @@ const XeroEntityLinkSchema = new Schema(
     companyId: { type: Schema.Types.ObjectId, ref: "Client", index: true },
     entityType: {
       type: String,
-      enum: ["customer", "company", "invoice", "payment"],
+      // "supplier" = Dooit itself as a contact in the client's Xero (localId "dooit").
+      // "company" is legacy (the client as its own contact) and no longer written.
+      enum: ["customer", "company", "supplier", "invoice", "payment"],
       required: true,
     },
     localId: { type: String, required: true },
@@ -22,6 +24,12 @@ const XeroEntityLinkSchema = new Schema(
     // Xero's UpdatedDateUTC at the last time we saw it, for inbound conflict checks.
     remoteUpdatedAt: { type: Date, default: null },
     remoteStatus: { type: String, default: null },
+    // Contacts: the name used in Xero when the plain name was already taken by
+    // a different contact (e.g. two customers called "Jane Citizen").
+    displayName: { type: String, default: null },
+    // Contacts: archived by Dooit (customer no longer eligible) — as opposed to
+    // archived by the client in Xero, which Dooit must respect.
+    archivedByDooit: { type: Boolean, default: false },
     lastSyncedAt: { type: Date, default: Date.now },
   },
   { timestamps: true }

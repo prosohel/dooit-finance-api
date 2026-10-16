@@ -30,6 +30,7 @@ const xero = require("./client");
 const { organisationToClientPrefill } = require("./mappers");
 const { logSync } = require("./syncLog");
 const requests = require("./connectionRequestService");
+const cleanup = require("./connectionCleanup");
 const { randomToken, issueLoginCode } = require("./loginCode");
 
 const TICKET_TTL_MS = 30 * 60 * 1000;
@@ -65,11 +66,21 @@ const findUserByEmail = (email) => User.findOne({ emailHash: hashForSearch(email
  */
 const handleSignupCallback = async ({ code, state }) => {
   const tk = await oauth.exchangeCode(code);
-  const claims = oauth.readIdToken(tk.idToken, state.nonce);
-  const email = String(claims.email).toLowerCase();
-
   const tenant = oauth.pickNewestTenant(await oauth.fetchConnections(tk.accessToken));
   if (!tenant) throw new ErrorResponse("No Xero organisation was authorised", 400);
+  try {
+    return await resolveSignup(tk, tenant, state);
+  } catch (err) {
+    // The visitor authorised the app but we are turning them away (account
+    // exists, email failed, bad id_token…): don't leave the connection behind.
+    await cleanup.releaseGrant({ tokens: tk, tenantId: tenant.tenantId, connectionId: tenant.id, reason: "signup_refused", meta: { status: err.statusCode || null } });
+    throw err;
+  }
+};
+
+const resolveSignup = async (tk, tenant, state) => {
+  const claims = oauth.readIdToken(tk.idToken, state.nonce);
+  const email = String(claims.email).toLowerCase();
 
   const org = await xero.getOrganisationWithToken(tk.accessToken, tenant.tenantId);
   const identity = {

@@ -14,6 +14,8 @@ const queue = require("../services/xero/jobQueue");
 const webhook = require("../services/xero/webhook");
 const signup = require("../services/xero/signupService");
 const requests = require("../services/xero/connectionRequestService");
+const settingsService = require("../services/xero/settingsService");
+const { billMappingComplete } = require("../services/xero/mappers");
 const { logSync } = require("../services/xero/syncLog");
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -43,8 +45,30 @@ const liveConnection = async (companyId) => {
   return conn;
 };
 
+/** The mapping as the UI may see it (ids/codes/names only). */
+const publicSettings = (s) =>
+  s
+    ? {
+        billAccountCode: s.billAccountCode || null,
+        billAccountName: s.billAccountName || null,
+        taxType: s.taxType || null,
+        taxTypeName: s.taxTypeName || null,
+        taxRatePercent: s.taxRatePercent ?? null,
+        billStatus: s.billStatus || "DRAFT",
+        syncPayments: !!s.syncPayments,
+        paymentAccountId: s.paymentAccountId || null,
+        paymentAccountName: s.paymentAccountName || null,
+        syncCustomers: !!s.syncCustomers,
+        configuredAt: s.configuredAt || null,
+      }
+    : null;
+
 const publicConnection = (conn, job) => ({
   connected: !!conn && conn.status === "connected",
+  setupComplete: billMappingComplete(conn?.settings),
+  settings: publicSettings(conn?.settings),
+  baseCurrency: conn?.baseCurrency || null,
+  xeroUrl: conn?.shortCode ? `https://go.xero.com/organisationlogin/default.aspx?shortcode=${encodeURIComponent(conn.shortCode)}` : null,
   status: conn?.status || "disconnected",
   tenantName: conn?.tenantName || null,
   tenantId: conn?.tenantId || null,
@@ -235,6 +259,38 @@ exports.syncNow = asyncHandler(async (req, res) => {
   });
   await logSync({ tenantId: conn.tenantId, companyId: conn.companyId, entity: "sync", action: "requested", status: "success", actor: req.user.id });
   res.status(202).json({ success: true, data: { ...publicConnection(conn, true), alreadyRunning: duplicate } });
+});
+
+// ── Mapping (accounts, tax rate, payments) ───────────────────────────────────
+
+const connectedOrThrow = async (req) => {
+  const conn = await liveConnection(resolveCompanyId(req));
+  if (!conn || conn.status !== "connected") {
+    throw new ErrorResponse(conn?.status === "revoked" ? "Xero access was revoked — please reconnect" : "Xero is not connected", 409);
+  }
+  return conn;
+};
+
+// @route GET /xero/settings — saved mapping + the organisation's live accounts and tax rates
+exports.getSettings = asyncHandler(async (req, res) => {
+  const conn = await connectedOrThrow(req);
+  const { options, problems } = await settingsService.loadOptions(conn);
+  res.status(200).json({ success: true, data: { settings: publicSettings(conn.settings), options, problems } });
+});
+
+// @route PUT /xero/settings — { billAccountCode, taxType, billStatus, syncPayments, paymentAccountId, syncCustomers }
+exports.saveSettings = asyncHandler(async (req, res) => {
+  const conn = await connectedOrThrow(req);
+  const wasComplete = billMappingComplete(conn.settings);
+  const settings = await settingsService.saveSettings(conn, req.body, { actor: req.user.id });
+  // A full pass picks up every issued invoice that waited for the mapping.
+  await queue.enqueue("full_sync", {
+    tenantId: conn.tenantId,
+    companyId: conn.companyId,
+    dedupeKey: `full:${conn.tenantId}`,
+    requestedBy: req.user.id,
+  });
+  res.status(200).json({ success: true, data: { settings: publicSettings(settings), firstSetup: !wasComplete } });
 });
 
 // @route GET /xero/logs?status=failed&limit=50

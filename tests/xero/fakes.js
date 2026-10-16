@@ -4,6 +4,7 @@
 const match = (doc, filter) =>
   Object.entries(filter).every(([k, v]) => {
     if (v && typeof v === "object" && !Array.isArray(v) && !(v instanceof Date)) {
+      if ("$exists" in v) return (doc[k] !== undefined && doc[k] !== null) === v.$exists;
       if ("$in" in v) return v.$in.map(String).includes(String(doc[k]));
       if ("$ne" in v) return String(doc[k]) !== String(v.$ne);
       if ("$lte" in v) return doc[k] <= v.$lte;
@@ -37,11 +38,13 @@ const makeStore = (uniqueKeys = []) => {
       Object.assign(r, u.$set || {}); Object.keys(u.$unset || {}).forEach((k) => delete r[k]); return { modifiedCount: 1 };
     },
     deleteOne: async (f) => { const i = rows.findIndex((x) => match(x, f)); if (i >= 0) rows.splice(i, 1); },
+    // Like Mongoose: returns the document as it was BEFORE the update unless `new: true`.
     findOneAndUpdate: async (f, u, o = {}) => {
       let r = rows.find((x) => match(x, f));
+      const before = r ? { ...r } : null;
       if (!r && o.upsert) { r = { _id: `id${++seq}`, ...Object.fromEntries(Object.entries(f).filter(([, v]) => typeof v !== "object")) }; rows.push(r); }
       if (r) { Object.assign(r, u.$set || {}); Object.keys(u.$unset || {}).forEach((k) => delete r[k]); }
-      return wrap(r);
+      return wrap(o.new === true ? r : before);
     },
     findOneAndDelete: (f) => {
       const i = rows.findIndex((x) => match(x, f));

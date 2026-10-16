@@ -13,6 +13,36 @@ const { Schema } = mongoose;
 
 const XERO_CONNECTION_STATUS = ["connected", "disconnected", "revoked", "error"];
 
+// How Dooit's bills land in THIS organisation's books. Chosen by the client's
+// admin from their own chart of accounts (Xero certification: never assume a
+// default code, never ask the user to type one). Codes are re-validated against
+// Xero before each sync because accounts can be archived after setup.
+const XeroSettingsSchema = new Schema(
+  {
+    // Expense account each bill line is coded to.
+    billAccountCode: { type: String, trim: true, default: null },
+    billAccountName: { type: String, trim: true, default: null },
+    // Xero tax rate applied to each line (Xero computes the tax).
+    taxType: { type: String, trim: true, default: null },
+    taxTypeName: { type: String, trim: true, default: null },
+    taxRatePercent: { type: Number, default: null }, // EffectiveRate snapshot, for the rate check
+    // Status new bills are created with: DRAFT | SUBMITTED (awaiting approval) | AUTHORISED.
+    billStatus: { type: String, enum: ["DRAFT", "SUBMITTED", "AUTHORISED"], default: "DRAFT" },
+    // Optional: record payments Dooit received against the bills.
+    syncPayments: { type: Boolean, default: false },
+    paymentAccountId: { type: String, trim: true, default: null },
+    paymentAccountCode: { type: String, trim: true, default: null },
+    paymentAccountName: { type: String, trim: true, default: null },
+    // Opt-in: send KYC customers (personal data) to Xero as contacts.
+    syncCustomers: { type: Boolean, default: false },
+    // Resolved from Accounts (SystemAccount ROUNDING); used for cent-level rounding lines.
+    roundingAccountCode: { type: String, trim: true, default: null },
+    configuredAt: { type: Date, default: null },
+    configuredBy: { type: Schema.Types.ObjectId, ref: "Users", default: null },
+  },
+  { _id: false }
+);
+
 const XeroConnectionSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, ref: "Users", required: true, index: true },
@@ -27,6 +57,12 @@ const XeroConnectionSchema = new Schema(
     refreshToken: { type: String, select: false, default: null },
     expiresAt: { type: Date, default: null },
     scopes: { type: [String], default: [] },
+
+    // Organisation facts used for data-integrity checks (multicurrency, deep links).
+    baseCurrency: { type: String, trim: true, default: null },
+    countryCode: { type: String, trim: true, default: null },
+    shortCode: { type: String, trim: true, default: null },
+    settings: { type: XeroSettingsSchema, default: () => ({}) },
 
     connectedAt: { type: Date, default: null },
     disconnectedAt: { type: Date, default: null },

@@ -30,6 +30,13 @@ const describeXeroError = (data) => {
   return data.Message || data.Detail || data.Title || null;
 };
 
+/** Xero's 403 when the organisation disconnected the app (or the user lost access). */
+const isTenantDisconnected = (status, data) =>
+  status === 403 && /AuthenticationUnsuccessful/i.test(describeXeroError(data) || "");
+
+const DISCONNECTED_MESSAGE =
+  "Dooit no longer has access to this Xero organisation (it was disconnected in Xero, or the connecting user lost access) — reconnect in Settings → Xero";
+
 const isDuplicateContact = (message) =>
   /already assigned to another contact|contact name .* already|must be unique/i.test(message || "");
 
@@ -50,9 +57,11 @@ const toError = (status, data) => {
 
 /**
  * @param {Object|String} connection  XeroConnection doc/lean object or its id
- * @param {{method?:string,path:string,params?:Object,data?:Object,headers?:Object}} opts
+ * @param {{method?:string,path:string,params?:Object,data?:Object,headers?:Object,idempotencyKey?:string}} opts
+ *   idempotencyKey — sent as `Idempotency-Key` so a create retried after a lost
+ *   response is not applied twice by Xero.
  */
-const request = async (connection, { method = "GET", path, params, data, headers = {} }) => {
+const request = async (connection, { method = "GET", path, params, data, headers = {}, idempotencyKey }) => {
   const conn =
     connection && connection._id
       ? connection
@@ -80,6 +89,7 @@ const request = async (connection, { method = "GET", path, params, data, headers
           "xero-tenant-id": conn.tenantId,
           Accept: "application/json",
           ...(data ? { "Content-Type": "application/json" } : {}),
+          ...(idempotencyKey ? { "Idempotency-Key": String(idempotencyKey).slice(0, 128) } : {}),
           ...headers,
         },
       });
@@ -109,6 +119,12 @@ const request = async (connection, { method = "GET", path, params, data, headers
       continue;
     }
     if (res.status >= 200 && res.status < 300) return res.data;
+    if (isTenantDisconnected(res.status, res.data)) {
+      // Disconnected from Xero's side: flip the connection so Settings shows
+      // "Reconnect" instead of retrying a dead organisation forever.
+      await tokens.markRevoked(conn, DISCONNECTED_MESSAGE);
+      throw new ErrorResponse(DISCONNECTED_MESSAGE, 401);
+    }
     throw toError(res.status, res.data);
   }
 };
@@ -129,8 +145,11 @@ const getContacts = async (conn, { page, ids, modifiedSince, where } = {}) => {
   return data?.Contacts || [];
 };
 
-const createContact = async (conn, contact) => {
-  const data = await request(conn, { method: "POST", path: "/Contacts", data: { Contacts: [contact] } });
+// Creates use PUT: Xero's POST is create-OR-UPDATE (a contact is matched by
+// name), so POSTing a second "Jane Citizen" silently overwrites the first one.
+// PUT only ever creates and answers a duplicate name with a validation error.
+const createContact = async (conn, contact, { idempotencyKey } = {}) => {
+  const data = await request(conn, { method: "PUT", path: "/Contacts", data: { Contacts: [contact] }, idempotencyKey });
   return data?.Contacts?.[0] || null;
 };
 
@@ -157,8 +176,15 @@ const getInvoices = async (conn, { page, ids, modifiedSince, statuses } = {}) =>
   return data?.Invoices || [];
 };
 
-const createInvoice = async (conn, invoice) => {
-  const data = await request(conn, { method: "POST", path: "/Invoices", data: { Invoices: [invoice] } });
+// unitdp=4: Dooit unit prices can carry more than 2 decimals.
+const createInvoice = async (conn, invoice, { idempotencyKey } = {}) => {
+  const data = await request(conn, {
+    method: "PUT", // create-only, as for contacts
+    path: "/Invoices",
+    params: { unitdp: 4 },
+    data: { Invoices: [invoice] },
+    idempotencyKey,
+  });
   return data?.Invoices?.[0] || null;
 };
 
@@ -166,6 +192,7 @@ const updateInvoice = async (conn, invoiceId, invoice) => {
   const data = await request(conn, {
     method: "POST",
     path: `/Invoices/${invoiceId}`,
+    params: { unitdp: 4 },
     data: { Invoices: [{ ...invoice, InvoiceID: invoiceId }] },
   });
   return data?.Invoices?.[0] || null;
@@ -181,12 +208,37 @@ const getPayments = async (conn, { page, modifiedSince, where } = {}) => {
   return data?.Payments || [];
 };
 
-const createPayment = async (conn, payment) => {
-  const data = await request(conn, { method: "PUT", path: "/Payments", data: { Payments: [payment] } });
+const createPayment = async (conn, payment, { idempotencyKey } = {}) => {
+  const data = await request(conn, { method: "PUT", path: "/Payments", data: { Payments: [payment] }, idempotencyKey });
   return data?.Payments?.[0] || null;
 };
 
+// ── Settings (read-only: accounting.settings.read) ───────────────────────────
+const getAccounts = async (conn) => (await request(conn, { path: "/Accounts" }))?.Accounts || [];
+
+const getTaxRates = async (conn) => (await request(conn, { path: "/TaxRates" }))?.TaxRates || [];
+
+const getCurrencies = async (conn) => (await request(conn, { path: "/Currencies" }))?.Currencies || [];
+
+const getOrganisation = async (conn) => (await request(conn, { path: "/Organisation" }))?.Organisations?.[0] || null;
+
 // ── Connection lifecycle ─────────────────────────────────────────────────────
+
+// What belongs to ONE organisation. When a company connects a different Xero
+// organisation, none of it may carry over: the mapping points at the old
+// organisation's chart of accounts, and nothing may be sent to the new one
+// until an admin has reviewed its settings.
+const ORG_SCOPED_RESET = {
+  settings: {},
+  baseCurrency: null,
+  countryCode: null,
+  shortCode: null,
+  lastSyncAt: null,
+  lastSyncStatus: "idle",
+  lastSyncSummary: null,
+  outboundCursor: null,
+  inboundCursor: null,
+};
 
 /**
  * Persist (or refresh) the company's connection from a token set + chosen
@@ -222,7 +274,7 @@ const upsertConnection = async ({ tokens: tk, tenant, userId, companyId }) => {
   const existing = await XeroConnection.findOne({ companyId }).sort({ updatedAt: -1 });
   let conn;
   if (existing) {
-    existing.set(fields);
+    existing.set(existing.tenantId === tenant.tenantId ? fields : { ...ORG_SCOPED_RESET, ...fields });
     conn = await existing.save();
   } else {
     conn = await XeroConnection.create(fields);
@@ -272,11 +324,29 @@ const connect = async ({ code, userId, companyId }) => {
   }
 
   const conn = await upsertConnection({ tokens: tk, tenant, userId, companyId });
+  await rememberOrganisation(conn);
   return conn;
 };
 
-/** Revoke the app's access to the organisation and wipe stored tokens. */
-const disconnect = async (conn, { actor = null } = {}) => {
+/** Store base currency / country / short code (best effort — never fails a connect). */
+const rememberOrganisation = async (conn) => {
+  try {
+    const org = await getOrganisation(conn);
+    if (!org) return null;
+    const facts = { baseCurrency: org.BaseCurrency || null, countryCode: org.CountryCode || null, shortCode: org.ShortCode || null };
+    await XeroConnection.updateOne({ _id: conn._id }, { $set: facts });
+    return facts;
+  } catch (err) {
+    console.error("[xero] could not read organisation:", err.message);
+    return null;
+  }
+};
+
+/**
+ * Revoke the app's access to the organisation and wipe stored tokens.
+ * `reason` is recorded in the audit log ("user", "subscription_ended", …).
+ */
+const disconnect = async (conn, { actor = null, reason = "user" } = {}) => {
   const cfg = getConfig();
   let remoteError = null;
 
@@ -318,6 +388,7 @@ const disconnect = async (conn, { actor = null } = {}) => {
     status: remoteError ? "failed" : "success",
     error: remoteError ? `remote revoke: ${remoteError}` : null,
     actor,
+    meta: { reason },
   });
   return { remoteRevoked: !remoteError };
 };
@@ -326,6 +397,12 @@ module.exports = {
   request,
   connect,
   upsertConnection,
+  rememberOrganisation,
+  getAccounts,
+  getTaxRates,
+  getCurrencies,
+  getOrganisation,
+  DISCONNECTED_MESSAGE,
   getOrganisationWithToken,
   disconnect,
   getContacts,

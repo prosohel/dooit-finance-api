@@ -33,6 +33,7 @@ const oauth = require("./oauth");
 const xero = require("./client");
 const { randomToken, createLoginSession } = require("./loginCode");
 const { logSync } = require("./syncLog");
+const cleanup = require("./connectionCleanup");
 
 // Audit event names (XeroSyncLog.action).
 const EVENTS = {
@@ -132,13 +133,30 @@ const confirmUrl = (token, suffix = "") => {
 
 const clearSecrets = { $unset: { accessToken: "", refreshToken: "" } };
 
-/** Move a still-pending request to a final state. Returns the updated doc or null. */
-const closePending = (filter, set) =>
-  XeroConnectionRequest.findOneAndUpdate(
+/**
+ * Move a still-pending request to a final state other than APPROVED (approve()
+ * claims its own). The Xero grant it held is discarded, so the connection that
+ * grant created is released at Xero too — unless `release: false` (the same
+ * Xero user is starting a fresh request and still needs that connection).
+ * Returns the updated doc or null.
+ */
+const closePending = async (filter, set, { release = true } = {}) => {
+  const before = await XeroConnectionRequest.findOneAndUpdate(
     { ...filter, status: REQUEST_STATUS.PENDING },
     { $set: set, ...clearSecrets },
-    { new: true }
+    { new: false, projection: "+accessToken +refreshToken" }
   );
+  if (!before) return null;
+  if (release) {
+    await cleanup.releaseStored(before, {
+      tenantId: before.xeroTenantId,
+      connectionId: before.xeroConnectionId,
+      reason: `request_${String(set.status || "closed").toLowerCase()}`,
+      meta: { requestId: String(before._id), failureReason: set.failureReason || null },
+    });
+  }
+  return XeroConnectionRequest.findById(before._id);
+};
 
 /**
  * Open (or reuse) an approval request and email the client.
@@ -177,7 +195,12 @@ const createRequest = async ({ match, tenant, org, identity, tokens }) => {
       return { requesterToken, maskedEmail: maskEmail(targetEmail), reused: true };
     }
     // A different person, or the cooldown has passed: supersede it.
-    const closed = await closePending({ _id: live._id }, { status: REQUEST_STATUS.EXPIRED, failureReason: "superseded", usedAt: new Date() });
+    const sameXeroUser = !!identity.xeroUserId && live.requesterXeroUserId === identity.xeroUserId;
+    const closed = await closePending(
+      { _id: live._id },
+      { status: REQUEST_STATUS.EXPIRED, failureReason: "superseded", usedAt: new Date() },
+      { release: !sameXeroUser }
+    );
     if (closed) await audit(closed, EVENTS.EXPIRED, "skipped", { error: "superseded by a newer request" });
   }
 
@@ -355,6 +378,7 @@ const approve = async ({ token, user }) => {
   try {
     await xero.upsertConnection({ tokens, tenant, userId: user.id, companyId: client._id });
   } catch (err) {
+    await cleanup.releaseGrant({ tokens, tenantId: req.xeroTenantId, connectionId: tenant.id, reason: "request_link_failed", meta: { requestId: String(claimed._id) } });
     await XeroConnectionRequest.updateOne(
       { _id: claimed._id },
       { $set: { status: REQUEST_STATUS.EXPIRED, failureReason: `link_failed: ${err.message}` } }

@@ -11,7 +11,7 @@ const XeroSyncLogSchema = new Schema(
     companyId: { type: Schema.Types.ObjectId, ref: "Client", index: true, default: null },
     entity: {
       type: String,
-      enum: ["contact", "invoice", "payment", "connection", "webhook", "sync"],
+      enum: ["contact", "invoice", "payment", "connection", "webhook", "sync", "settings"],
       required: true,
     },
     entityId: { type: String, default: null }, // Dooit id or Xero id

@@ -1,7 +1,12 @@
 "use strict";
 
-// Pure mapping functions: Dooit documents -> Xero payloads (and back for the
-// few inbound fields we accept). No I/O here, so they are trivially testable.
+// Pure mapping functions: Dooit documents -> Xero payloads. No I/O here, so
+// they are trivially testable.
+//
+// Direction of the books: the connected Xero organisation belongs to the Dooit
+// CLIENT. A Dooit invoice is therefore a BILL in their Xero (ACCPAY, supplier =
+// Dooit), coded to the expense account and tax rate the client chose in
+// Settings → Xero. It is never a sales invoice in their books.
 
 const { toNumber } = require("../../utils/money");
 const { getConfig } = require("../../config/xero");
@@ -21,6 +26,14 @@ const compact = (obj) =>
   Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null && v !== ""));
 
 const toIsoDate = (d) => (d ? new Date(d).toISOString().slice(0, 10) : undefined);
+
+/** Round half away from zero to cents — how Xero rounds line and tax amounts. */
+const round2 = (n) => (Math.sign(n) * Math.round(Math.abs(n) * 100 + 1e-9)) / 100;
+
+const decimals = (n) => {
+  const s = String(n);
+  return s.includes(".") ? s.split(".")[1].length : 0;
+};
 
 const addressBlock = (type, a = {}) => {
   const block = compact({
@@ -55,93 +68,162 @@ const customerToContact = (customer) => {
   });
 };
 
-/** Company (Client) -> Xero Contact. */
-const companyToContact = (client) => {
-  const name = clean(client?.name);
+/**
+ * Why a customer must NOT be in the client's Xero, or null when it may be.
+ * Only customers whose KYC is verified go to Xero — never anyone with a
+ * sanctions match or flagged screening, nor offboarded or deactivated records.
+ * (A contact in Xero is someone the client can invoice; an AML tool must not
+ * hand them a sanctioned or unverified person to trade with.)
+ */
+const customerSyncBlock = (c = {}) => {
+  if (c.isActive === false) return "customer is inactive";
+  if (c.status === "Offboarded") return "customer was offboarded";
+  if (c.sanction) return "sanctions match";
+  if (c.amlStatus === "flagged") return "AML screening flagged";
+  if (c.kycStatus !== "verified") return `KYC ${String(c.kycStatus || "not verified").replace(/_/g, " ")}`;
+  return null;
+};
+
+/** Dooit itself, as the supplier contact on the client's bills. */
+const supplierToContact = (supplier = getConfig().supplier) => {
+  const name = clean(supplier?.name);
   if (!name) return null;
-  const addr = addressBlock("STREET", client.address);
-  const phone = clean(client.phone);
   return compact({
     Name: name,
-    EmailAddress: clean(client.email),
-    Addresses: addr ? [addr] : undefined,
-    Phones: phone ? [{ PhoneType: "DEFAULT", PhoneNumber: phone }] : undefined,
-    TaxNumber: clean(client.taxId),
-    Website: clean(client.website),
-    AccountNumber: `DOOIT-K-${String(client._id).slice(-8).toUpperCase()}`,
+    EmailAddress: clean(supplier.email),
+    TaxNumber: clean(supplier.taxNumber),
+    Website: clean(supplier.website),
   });
 };
 
-const INVOICE_STATUS_MAP = {
-  draft: "DRAFT",
-  open: "AUTHORISED",
-  overdue: "AUTHORISED",
-  paid: "AUTHORISED", // becomes PAID in Xero once its payment is applied
-  void: "VOIDED",
+/** Mapping is usable for bills once an account and a tax rate are chosen. */
+const billMappingComplete = (settings) => !!(settings?.billAccountCode && settings?.taxType);
+
+/**
+ * Line amount and the quantity/unit split Xero will accept. Unit prices go up
+ * to 4 dp (requests carry `unitdp=4`); anything finer, or a split that does not
+ * reproduce the line total exactly, is sent as 1 × amount so totals never drift.
+ */
+const lineShape = (l, amount) => {
+  const qty = l.quantity;
+  const unit = l.unitPrice == null ? null : toNumber(l.unitPrice);
+  const exact =
+    qty > 0 && unit != null && decimals(unit) <= 4 && round2(qty * unit) === amount;
+  return exact ? { Quantity: qty, UnitAmount: unit } : { Quantity: 1, UnitAmount: amount };
 };
 
 /**
- * Dooit Invoice -> Xero ACCREC invoice.
+ * Dooit Invoice -> Xero bill (ACCPAY).
  *
- * Lines are sent with LineAmountTypes "NoTax": Dooit has already computed
- * discount and tax as their own lines, and letting Xero re-derive tax would
- * make the totals disagree with the issued invoice.
+ * Tax is NOT posted as an amount: each line carries the mapped Xero TaxType and
+ * Xero calculates it (Xero certification, "Taxes"). Xero rounds tax per line
+ * while Dooit rounds once on the invoice, so the totals can differ by a cent or
+ * two; that difference is posted as a rounding line to the organisation's
+ * rounding account (Xero's recommended approach). A larger difference means the
+ * mapping is wrong, and the bill is not sent.
+ *
+ * @returns {{ payload: Object, expectedTotal: number } | { error: string }}
  */
-const invoiceToXero = (invoice, contactId) => {
-  const cfg = getConfig();
-  const lines = (invoice.lineItems || []).map((l) => {
-    const amount = toNumber(l.amount);
-    const qty = l.quantity;
-    const unit = l.unitPrice == null ? null : toNumber(l.unitPrice);
-    const exact =
-      qty > 0 && unit != null && Math.abs(+(qty * unit).toFixed(2) - amount) < 0.005;
-    return {
-      Description: l.description,
-      Quantity: exact ? qty : 1,
-      UnitAmount: exact ? unit : amount,
-      AccountCode: cfg.salesAccountCode,
-      TaxType: "NONE",
-    };
-  });
+const invoiceToBill = (invoice, { contactId, settings = {}, appUrl = "" } = {}) => {
+  if (!billMappingComplete(settings)) {
+    return { error: "Choose an expense account and a tax rate in Settings → Xero before bills can be sent" };
+  }
 
-  return compact({
-    Type: "ACCREC",
-    Contact: { ContactID: contactId },
-    LineItems: lines,
-    LineAmountTypes: "NoTax",
-    Date: toIsoDate(invoice.issuedAt || invoice.createdAt || invoice.periodEnd),
-    DueDate: toIsoDate(invoice.dueAt),
-    Reference: invoice.invoiceNumber || undefined,
-    InvoiceNumber: invoice.invoiceNumber || undefined,
-    CurrencyCode: invoice.currency || "AUD",
-    Status: INVOICE_STATUS_MAP[invoice.status] || "DRAFT",
-  });
+  const invoiceRate = Number(invoice.taxRatePercent) || 0;
+  const mappedRate = Number(settings.taxRatePercent);
+  if (!Number.isFinite(mappedRate) || Math.abs(mappedRate - invoiceRate) > 0.0001) {
+    return {
+      error: `The mapped Xero tax rate "${settings.taxTypeName || settings.taxType}" is ${Number.isFinite(mappedRate) ? mappedRate : "?"}% but invoice ${invoice.invoiceNumber || ""} charged ${invoiceRate}% — choose a matching tax rate in Settings → Xero`.replace(/ {2}/g, " "),
+    };
+  }
+
+  const lines = [];
+  let expectedSubtotal = 0;
+  let expectedTax = 0;
+  for (const l of invoice.lineItems || []) {
+    if (l.lineType === "tax") continue; // Xero derives tax from TaxType
+    let amount = round2(toNumber(l.amount));
+    if (l.lineType === "discount") amount = -Math.abs(amount); // stored positive in Dooit
+    const shape = l.lineType === "discount" ? { Quantity: 1, UnitAmount: amount } : lineShape(l, amount);
+    lines.push({
+      Description: l.description,
+      ...shape,
+      AccountCode: settings.billAccountCode,
+      TaxType: settings.taxType,
+    });
+    expectedSubtotal += amount;
+    expectedTax += round2((amount * mappedRate) / 100);
+  }
+  if (!lines.length) return { error: `Invoice ${invoice.invoiceNumber || ""} has no lines to send`.trim() };
+
+  const dooitTotal = round2(toNumber(invoice.total));
+  const xeroTotal = round2(expectedSubtotal + expectedTax);
+  const diff = round2(dooitTotal - xeroTotal);
+  if (diff !== 0) {
+    const tolerance = 0.01 * lines.length;
+    if (Math.abs(diff) > tolerance || !settings.roundingAccountCode) {
+      return {
+        error: `Invoice ${invoice.invoiceNumber || ""} totals ${dooitTotal.toFixed(2)} in Dooit but would total ${xeroTotal.toFixed(2)} in Xero${settings.roundingAccountCode ? "" : " (no rounding account found in Xero)"}`.replace(/ {2}/g, " "),
+      };
+    }
+    lines.push(
+      compact({
+        Description: `Rounding adjustment: Dooit total ${dooitTotal.toFixed(2)}`,
+        Quantity: 1,
+        UnitAmount: diff,
+        AccountCode: settings.roundingAccountCode,
+        TaxType: settings.roundingTaxType || undefined,
+      })
+    );
+  }
+
+  const url = /^https:\/\//i.test(appUrl) ? `${appUrl.replace(/\/+$/, "")}/dashboard/client/billing/invoices/${invoice._id}` : undefined;
+
+  return {
+    expectedTotal: dooitTotal,
+    payload: compact({
+      Type: "ACCPAY",
+      Contact: { ContactID: contactId },
+      LineItems: lines,
+      LineAmountTypes: "Exclusive",
+      Date: toIsoDate(invoice.issuedAt || invoice.createdAt || invoice.periodEnd),
+      DueDate: toIsoDate(invoice.dueAt),
+      // For bills, InvoiceNumber is the supplier's reference — Dooit's number.
+      InvoiceNumber: invoice.invoiceNumber || undefined,
+      CurrencyCode: invoice.currency || "AUD",
+      Status: settings.billStatus || "DRAFT",
+      // Adds a "Go to <app>" button on the bill in Xero.
+      Url: url,
+    }),
+  };
 };
 
 /**
- * Dooit Payment -> Xero Payment. Returns null for anything Xero models
- * differently (refunds are credit notes) or cannot accept (no bank account).
+ * Status a Dooit void becomes in Xero: an unapproved bill is deleted, an
+ * approved one is voided. A paid bill cannot be voided through the API.
+ * @returns {"DELETED"|"VOIDED"|null}
  */
-const paymentToXero = (payment, xeroInvoiceId) => {
-  const cfg = getConfig();
+const voidStatusFor = (remoteStatus) => {
+  if (["DRAFT", "SUBMITTED"].includes(remoteStatus)) return "DELETED";
+  if (remoteStatus === "AUTHORISED") return "VOIDED";
+  return null;
+};
+
+/**
+ * Dooit Payment -> Xero Payment on the bill. Returns null for anything Xero
+ * models differently (refunds are credit notes) or the client has not enabled.
+ */
+const paymentToXero = (payment, xeroInvoiceId, settings = {}) => {
   if (payment.type !== "payment" || payment.status !== "paid") return null;
-  if (!cfg.paymentAccountCode) return null;
+  if (!settings.syncPayments || !settings.paymentAccountId) return null;
   return compact({
     Invoice: { InvoiceID: xeroInvoiceId },
-    Account: { Code: cfg.paymentAccountCode },
-    Amount: toNumber(payment.amount),
+    Account: { AccountID: settings.paymentAccountId },
+    Amount: round2(toNumber(payment.amount)),
     Date: toIsoDate(payment.paidAt || payment.createdAt),
     Reference: payment.uid || payment.transactionId || undefined,
   });
 };
-
-/** The subset of a Xero Contact Dooit will accept inbound. */
-const xeroContactToLocal = (contact) =>
-  compact({
-    name: clean(contact?.Name),
-    email: clean(contact?.EmailAddress)?.toLowerCase(),
-    phone: clean((contact?.Phones || []).find((p) => p.PhoneNumber)?.PhoneNumber),
-  });
 
 /** Xero returns .NET dates as "/Date(1700000000000+0000)/" in some payloads. */
 const parseXeroDate = (v) => {
@@ -193,10 +275,12 @@ const organisationToClientPrefill = (org = {}, identity = {}) => {
 module.exports = {
   organisationToClientPrefill,
   customerToContact,
-  companyToContact,
-  invoiceToXero,
+  customerSyncBlock,
+  supplierToContact,
+  billMappingComplete,
+  invoiceToBill,
+  voidStatusFor,
   paymentToXero,
-  xeroContactToLocal,
   parseXeroDate,
-  INVOICE_STATUS_MAP,
+  round2,
 };

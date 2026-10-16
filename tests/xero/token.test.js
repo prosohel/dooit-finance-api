@@ -128,3 +128,19 @@ describe("API client request helper", () => {
     await expect(client.getContacts({ _id: "conn1", status: "connected", tenantId: null })).rejects.toMatchObject({ statusCode: 409 });
   });
 });
+
+describe("creates never update by accident", () => {
+  // Xero's POST /Contacts and /Invoices are create-or-update (contacts match on
+  // name), which silently merged same-name customers. Creates must use PUT.
+  it("creates contacts and bills with PUT, updates with POST", async () => {
+    http.send.mockResolvedValue({ status: 200, data: { Contacts: [{ ContactID: "C" }], Invoices: [{ InvoiceID: "I" }] } });
+    await client.createContact("conn1", { Name: "Jane" });
+    await client.createInvoice("conn1", { Type: "ACCPAY" });
+    await client.updateContact("conn1", "C", { Name: "Jane" });
+    expect(http.send.mock.calls.map(([r]) => `${r.method} ${new URL(r.url).pathname}`)).toEqual([
+      "PUT /api.xro/2.0/Contacts",
+      "PUT /api.xro/2.0/Invoices",
+      "POST /api.xro/2.0/Contacts/C",
+    ]);
+  });
+});

@@ -30,16 +30,19 @@ Read this first if you are going to change, debug or extend the Xero integration
         ┌──────────────── services/xero/ ─────────────────────┐
         │ oauth ─ tokenService ─ client      (talk to Xero)    │
         │ mappers                           (pure: Dooit⇄Xero) │
-        │ syncService                       (idempotent push/pull)
+        │ settingsService                   (account/tax mapping)│
+        │ syncService                       (idempotent push, tracked pull)
         │ jobQueue + webhook                (async work)       │
+        │ connectionCleanup                 (release unused connections)
         │ signupService                     ("Sign up with Xero")
         └───────────┬───────────────────────────┬─────────────┘
                     ▼                           ▼
               Mongo (7 collections)        Xero (identity, connections, accounting API)
 ```
 
-Three ideas carry the whole design:
+Four ideas carry the whole design:
 
+0. **It is the client's Xero, so Dooit is their supplier.** A Dooit invoice becomes a **bill (ACCPAY)** in the client's books, from a "Dooit.ai" supplier contact, coded to the expense account and tax rate the client chose (`XeroConnection.settings`). Nothing in their Xero ever changes Dooit's invoices, payments or KYC records.
 1. **One company ↔ one Xero organisation.** `XeroConnection.companyId` is the Dooit `Client` (tenant); `tenantId` is the Xero org. Every sync is scoped to that pair.
 2. **Idempotency by link table + hash.** `XeroEntityLink` remembers `Dooit id → Xero id` and the hash of the last payload we pushed. Re-running a sync never duplicates anything and never re-sends unchanged data.
 3. **Nothing slow happens in a request.** Webhooks and "Sync Now" only write a `XeroJob`; a Mongo-backed worker does the work with retries.
@@ -61,8 +64,10 @@ Tokens are the sensitive part: refresh tokens are **single-use** at Xero, stored
 | `services/xero/oauth.js` | State create/consume, authorize URL, code exchange, `/connections`, id_token validation |
 | `services/xero/tokenService.js` | `getAccessToken`, `refreshAccessToken`, rotation, revoke handling |
 | `services/xero/client.js` | `request()` (the one request helper) + `getContacts/createContact/…`, `connect`, `disconnect`, `upsertConnection` |
-| `services/xero/mappers.js` | Pure functions: customer/company/invoice/payment ⇄ Xero, org → signup prefill |
-| `services/xero/syncService.js` | `pushContact/pushInvoice/pushPayment`, `runOutbound`, `runInbound`, `runSync` |
+| `services/xero/mappers.js` | Pure functions: customer/supplier contact, invoice → bill, payment, void status, org → signup prefill |
+| `services/xero/settingsService.js` | Live Accounts/TaxRates/Currencies for the mapping screen; validates and saves `settings`; pre-sync re-validation |
+| `services/xero/syncService.js` | `pushContact/pushBill/pushPayment`, `runOutbound`, `runInbound` (tracking only), `runSync` |
+| `services/xero/connectionCleanup.js` | Releases connections Dooit won't use (abandoned sign-ups, rejected/expired requests) and disconnects off-boarded companies |
 | `services/xero/jobQueue.js` | `enqueue`, `processNext`, scheduler, `startXeroWorker` |
 | `services/xero/webhook.js` | Signature verification + event → job intake |
 | `services/xero/signupService.js` | Sign up with Xero for a NEW organisation (ticket → prefilled form → account) |
@@ -80,7 +85,8 @@ Tokens are the sensitive part: refresh tokens are **single-use** at Xero, stored
 | File | Responsibility |
 |---|---|
 | `app/dashboard/client/system-settings/xero/{page.js,actions.js}` | Settings route + server actions (`fetchWithAuth`) |
-| `views/xero/index.jsx` | Settings card: connect / sync / disconnect / errors |
+| `views/xero/index.jsx` | Settings page: connect / sync / disconnect, sync activity log |
+| `views/xero/XeroMappingCard.jsx` | Account / tax rate / bill status / payments / customers mapping (dropdowns only) |
 | `app/auth/xero/{page.js,actions.js}` | Public sign-up landing + server actions |
 | `views/auth/xero/index.jsx` | Pre-filled signup form, auto sign-in |
 | `auth.js` | NextAuth `xero` credentials provider (redeems the login code) |
@@ -100,15 +106,15 @@ XeroConnectionRequest ── Client                      ← "link this org to a
 
 | Collection | Purpose | Key facts |
 |---|---|---|
-| `XeroConnection` | The authorised org for a company | `refreshToken`/`accessToken` are **ciphertext + `select:false`**; `toJSON` deletes them. Partial-unique indexes: one `connected` row per `companyId` and per `tenantId`. Holds `lastSync*` fields the UI shows |
-| `XeroEntityLink` | External-ID map | Unique `(tenantId, entityType, localId)` **and** `(tenantId, entityType, xeroId)`. `payloadHash` = hash of last pushed payload. `entityType ∈ customer\|company\|invoice\|payment` |
+| `XeroConnection` | The authorised org for a company | `refreshToken`/`accessToken` are **ciphertext + `select:false`**; `toJSON` deletes them. Partial-unique indexes: one `connected` row per `companyId` and per `tenantId`. Holds `lastSync*` fields the UI shows, `baseCurrency/countryCode/shortCode`, and `settings` (bill account, tax type + rate snapshot, bill status, payments on/off + account, customers on/off, rounding account) |
+| `XeroEntityLink` | External-ID map | Unique `(tenantId, entityType, localId)` **and** `(tenantId, entityType, xeroId)`. `payloadHash` = hash of last pushed payload; `remoteStatus` = bill/contact status last seen in Xero. `entityType ∈ customer\|supplier\|invoice\|payment` (`company` is legacy, no longer written) |
 | `XeroSyncLog` | Append-only audit/sync log | `entity, action, direction, status, error, payloadHash, actor`. **Never** tokens or bodies. 1-year TTL |
 | `XeroJob` | Work queue | `status: queued→running→done\|dead`. Partial-unique `dedupeKey` while queued/running. `done` rows expire after 30 days |
 | `XeroOAuthState` | One-time CSRF state | Stores SHA-256 of state. `purpose: connect\|signup`, `nonce` for signup. 10-min TTL |
 | `XeroSignup` | Sign-up bridge | Hashed ticket + login code, encrypted Xero tokens, `prefill`. 1-h TTL |
 | `XeroConnectionRequest` | Approval to link an org to an existing client | `status PENDING_CONFIRMATION→APPROVED\|REJECTED\|EXPIRED`. `tokenHash` (emailed) + `requesterTokenHash` (requester's browser), both SHA-256 + `select:false`; Xero tokens encrypted and **wiped on any final state**. Partial-unique `(clientId, xeroTenantId)` while pending. 30-day TTL |
 
-Existing Dooit models are **read** (Client, Customer, Invoice, Payment) and, for inbound changes, narrowly **written** (see §8 rules 6–7). `Customer` PII is role-encrypted; sync code must treat `"***"`/ciphertext as "absent".
+Existing Dooit models (Client, Customer, Invoice, Payment, Subscription) are **only read** by the integration. `Customer` PII is role-encrypted; sync code must treat `"***"`/ciphertext as "absent".
 
 ---
 
@@ -153,9 +159,11 @@ getAccessToken(id)
 
 ```
 claim connection (lastSyncStatus=running; reclaims runs stale >30 min)
-  runOutbound:  company contact → customers → invoices → payments
-  runInbound:   linked contacts (If-Modified-Since) → linked invoices (+ their payments)
-  write summary + cursors, status success|partial|failed
+  settings saved? no → nothing outbound ("setup")
+  validateForSync: mapped account/tax rate still ACTIVE in Xero? currencies enabled?
+  runOutbound:  customers (opt-in) → supplier contact → bills → payments (opt-in)
+  runInbound:   linked contacts/bills (If-Modified-Since) → remoteStatus only
+  write summary + cursors (outbound cursor held while bills are blocked), status success|partial|failed
 ```
 Per entity the push is always the same shape:
 
@@ -170,12 +178,13 @@ save link {xeroId, payloadHash}; logSync(...)
 
 | Dooit | → Xero | Notes |
 |---|---|---|
-| `Client` | Contact | `AccountNumber = DOOIT-K-<last8 id>` |
-| `Customer` (individual) | Contact | skipped if no usable name |
-| `Invoice` (not draft) | ACCREC Invoice | `LineAmountTypes: NoTax`; Dooit discount/tax lines sent as lines so totals match to the cent |
-| `Payment` (`paid`, `payment`) | Payment | needs `XERO_PAYMENT_ACCOUNT_CODE` and the invoice already in Xero; refunds skipped |
+| Dooit itself (`XERO_SUPPLIER_*`) | Contact (supplier) | link `supplier/dooit`; adopts an existing ACTIVE contact of the same name |
+| `Customer` (individual) | Contact | **opt-in** (`settings.syncCustomers`); only when `customerSyncBlock()` is null (KYC verified; not sanctioned/flagged/offboarded/inactive), otherwise a linked contact is archived (`archivedByDooit`); same-name → unique `displayName`, never adopted unless email/account number match |
+| `Invoice` (issued) | **ACCPAY bill** | `LineAmountTypes: Exclusive`; each line `AccountCode` + `TaxType` from settings; Dooit's tax line dropped (Xero computes tax); discount sent negative; cent-level rounding line to the org's ROUNDING account; refused if the mapped rate ≠ `invoice.taxRatePercent` or the currency isn't enabled; `Url` = deep link back to Dooit; `unitdp=4`; Idempotency-Key on create |
+| `Invoice` voided | bill | `DELETED` (draft/submitted) or `VOIDED` (approved); a paid bill is flagged, never forced |
+| `Payment` (`paid`, `payment`) | Payment on the bill | **opt-in**; only once the bill is `AUTHORISED` in Xero; account = `settings.paymentAccountId`; refunds skipped |
 
-Inbound: contact name/email/phone → `Client` (and plaintext-only `Customer` fields), last-writer-wins on `UpdatedDateUTC`; Xero payments on linked invoices → new Dooit `Payment` (`gateway:"xero"`, `transactionId:"xero:<id>"`) then `reconcileInvoice()`; a Xero VOID is **logged, not applied**.
+Inbound is **tracking only**: bill status (approved / paid / voided) and contact status (archived) are stored on the link and logged. Nothing in the client's Xero changes a Dooit record — their books are not evidence that Dooit was paid, and KYC data is verified evidence, not editable contact info.
 
 **Queue:** `enqueue(type, {...dedupeKey})` → worker polls every 15 s, atomically claims (`findOneAndUpdate`), runs. Failure → back to `queued` with `nextRunAt = now + 30s·2^(attempts-1)`; `dead` after `XERO_JOB_MAX_ATTEMPTS` or on 401/409. Jobs stuck `running` >15 min are recovered. A scheduler enqueues an incremental sync per connection every `XERO_SYNC_INTERVAL_MIN` (deduped per window).
 
@@ -257,13 +266,13 @@ Key points when changing this code:
 
 ## 5. Run it locally
 
-1. Create a Xero **demo company** and a Xero app (Web app). Add scopes: `offline_access accounting.contacts accounting.transactions accounting.settings openid profile email`.
+1. Create a Xero **demo company** and a Xero app (Web app). New apps only get granular scopes; the integration requests `offline_access accounting.contacts accounting.invoices accounting.payments accounting.settings.read` (+ `openid profile email` for sign-up).
 2. Expose your API over HTTPS (Xero requires https except `localhost` redirects): `ngrok http 6830` → `https://abc.ngrok.app`.
 3. API env (`config/config.env`):
    ```
    XERO_CLIENT_ID=…            XERO_CLIENT_SECRET=…
    XERO_REDIRECT_URI=https://abc.ngrok.app/api/v1/xero/callback
-   XERO_WEBHOOK_KEY=…          XERO_PAYMENT_ACCOUNT_CODE=090
+   XERO_WEBHOOK_KEY=…          XERO_SUPPLIER_NAME=Dooit.ai
    XERO_POST_CONNECT_URL=http://localhost:8001/dashboard/client/system-settings/xero
    XERO_SIGNUP_URL=http://localhost:8001/auth/xero
    ENCRYPTION_KEY=<64 hex>     # already required by the app
@@ -333,10 +342,11 @@ In `signupService.completeSignup` set `isActive:false` on the new `User`, send t
 2. **Never log or return tokens.** `XeroConnection` strips them in `toJSON`; keep it that way. Sync logs store a *hash*, not payloads.
 3. **Webhook needs the raw body.** `express.raw` is mounted on that route *before* any `express.json()`. Re-parsing then re-stringifying breaks the signature.
 4. **Don't call Xero inside the webhook handler** (5-second deadline) — enqueue only.
-5. **Changing a mapper changes hashes** → every entity looks "changed" once and is re-sent. That's safe (update, not create) but plan for the API quota (60/min/org).
-6. **Customer PII may be encrypted at rest.** Outbound: `clean()` drops `"***"`/ciphertext. Inbound: write via the raw collection and skip fields that `looksEncrypted`. Never overwrite ciphertext with plaintext.
-7. **Invoices are immutable once issued** and voiding is a human action (releases usage). Inbound Xero voids are logged, not applied. Payments from Xero are written as `Payment` docs then `reconcileInvoice()` — don't set invoice status directly.
-8. **`NoTax` line mode is deliberate.** Dooit already computed tax/discount; letting Xero recompute makes totals drift.
+5. **Changing a mapper (or a mapping) changes hashes** → every entity looks "changed" once. Contacts are updated; a bill is re-coded only while it is DRAFT/SUBMITTED in Xero, never once approved. Plan for the API quota (60/min/org).
+6. **Customer PII may be encrypted at rest.** Outbound: `clean()` drops `"***"`/ciphertext. Customers only go to Xero when the client opted in.
+7. **Inbound never writes Dooit data.** Don't reintroduce "payment in Xero ⇒ Dooit invoice paid": the client's books are theirs, and that would let a client clear its own Dooit invoice.
+8a. **Create with PUT, update with POST.** Xero's POST /Contacts is create-or-update matched by *name* — POSTing a second "Jane Citizen" silently overwrote the first (seen in testing). Idempotency keys name the operation (`put-contact`, `put-bill`) because Xero rejects a key reused for a different request.
+8. **Never post tax amounts or assume account codes** (Xero certification). Tax comes from the mapped `TaxType`; accounts come from the client's dropdown choice, validated against Xero on save and before every sync.
 9. **`asyncHandler` doesn't return its promise** — in controller unit tests wait on `res`/`next`, not on the handler (see `oauth.test.js`).
 10. **One `connected` row per company and per org** is enforced by partial-unique indexes; `upsertConnection` also pre-checks to give a friendly 409.
 11. **Dedupe keys are your idempotency.** Use them for anything that can be redelivered/double-clicked (`full:<tenant>`, `wh:<tenant>:<cat>:<id>:<ts>`, `incr:<tenant>:<window>`).
@@ -349,7 +359,7 @@ In `signupService.completeSignup` set `isActive:false` on the new `User`, send t
 ## 9. Testing
 
 ```bash
-npm run test:xero        # 122 tests, ~2 s, no MongoDB
+npm run test:xero        # 159 tests, ~3 s, no MongoDB
 ```
 Approach: external boundaries are mocked, not the code under test —
 `services/xero/http` (axios) and the Mongoose models via the in-memory `tests/xero/fakes.js`. Env is set in `tests/xero/setup.js`.
@@ -358,9 +368,11 @@ Approach: external boundaries are mocked, not the code under test —
 |---|---|
 | `oauth.test.js` | State single-use, authorize URL, callback controller |
 | `token.test.js` | Refresh/rotation/encryption/expiry, 401-retry-once, 429, network, duplicate-contact |
-| `mappers.test.js` | Customer/company/invoice/payment mapping, masked-PII, totals parity |
+| `mappers.test.js` | Customer/supplier contacts, invoice → bill (tax rate check, rounding line, discount sign, 4-dp units, deep link), void status, payments, masked-PII |
 | `webhook.test.js` | Signature (good/bad/missing), 401/200 behaviour, dedupe, unsupported events |
-| `sync.test.js` | Duplicate prevention, adopt-on-duplicate, no payment echo |
+| `sync.test.js` | Duplicate prevention, idempotency keys, adopt ACTIVE only, bills (create/skip/re-code/void/paid), currency check, payment gating, inbound tracking-only, setup gating |
+| `settings.test.js` | Filtered dropdown lists, save validation (no typed/archived codes), rounding resolution, re-validation problems |
+| `cleanup.test.js` | Releasing unused connections (guard for live orgs), abandoned sign-ups, off-boarding disconnects |
 | `signup.test.js` | id_token checks, prefill, ticket/loginCode single-use & expiry, rollback; known org → pending request (never auto sign-in) |
 | `connectionRequest.test.js` | Matching priority, request + email, hashed secrets, duplicate protection, approve/reject/expiry/replay, unauthorised approvers, tenant mismatch, requester continue, email escaping |
 | `connectionRequestRoutes.test.js` | Route auth: approve needs a signed-in user, reject/details/pending are token-based |
@@ -409,7 +421,10 @@ To force a clean re-push of one entity: delete its `XeroEntityLink` **only if** 
 | Public endpoints | rate-limited (60/15 min/IP; 30/15 min for token-in-URL approval routes); each step needs a one-time secret |
 | Account takeover | A Xero email or org name can never claim an existing client: it needs the client's own admin to approve (emailed single-use token **and** signed-in client admin). Existing users are never signed in by Xero email alone; new account email = Xero email |
 | Caching/headers | `Cache-Control: no-store` on all Xero routes; `helmet` global |
-| Audit | every connect/refresh/disconnect/sync/webhook/signup → `XeroSyncLog` with actor |
+| Audit | every connect/refresh/disconnect (with reason)/mapping change/sync/webhook/signup/release → `XeroSyncLog` with actor |
+| Unused connections | abandoned sign-ups, rejected/expired approval requests and refused sign-ups are released at Xero (`DELETE /connections/{id}`); off-boarded companies are disconnected hourly |
+| Disconnect from Xero's side | a 403 `AuthenticationUnsuccessful` marks the connection `revoked` so Settings shows Reconnect |
+| Financial integrity | inbound Xero data is tracking-only; it can't mark Dooit invoices paid or edit KYC records |
 | Transport | https redirect/webhook URLs required (config validation rejects non-https except localhost) |
 
 ---
@@ -418,7 +433,9 @@ To force a clean re-push of one entity: delete its `XeroEntityLink` **only if** 
 
 Repo: `dooit-finance-web`. Patterns used: server actions over `fetchWithAuth` (so the JWT never reaches client JS), thin `page.js` + `views/` component, shadcn/`sonner`.
 
-* **Settings card** (`/dashboard/client/system-settings/xero`): polls `GET /xero/status` every 2.5 s while `syncing`; disables Sync Now while a sync is queued/running; shows org, connected date, last sync, per-entity counts, errors; Disconnect behind a confirm dialog; reconnect button on `revoked`. Reads `?xero=` after the OAuth callback and toasts the result.
+* **Settings card** (`/dashboard/client/system-settings/xero`): polls `GET /xero/status` every 2.5 s while `syncing`; disables Sync Now while a sync is queued/running; shows org, connected date, last sync, per-entity counts, errors; "Disconnect from Xero" behind a confirm dialog; "Reconnect to Xero" on `revoked`; "Open in Xero" deep link. Reads `?xero=` after the OAuth callback and toasts the result.
+* **Mapping card** (`XeroMappingCard`): `GET /xero/settings` → dropdowns of active expense accounts, expense tax rates, bill status, payment accounts; "Refresh lists" keeps unsaved choices; deep links to the chart of accounts / tax rates in Xero; `PUT /xero/settings` (the API re-validates every code). Nothing is sent until it is saved once.
+* **Sync activity**: Errors / All activity from `GET /xero/logs`; result shown as text + colour.
 * **Sign up page** (`/auth/xero`, public via the `/auth` prefix in `middleware.js`): no params → starts the flow (works as the App Store launch link); `?ticket` → pre-filled form; `?pending` → "waiting for confirmation" screen (polls; handle kept in `sessionStorage`, stripped from the URL); `?loginCode` → `signIn("xero", {loginCode})` then `/dashboard/client`; `?error` → message + retry. The approver's page is `/auth/xero/confirm/[token]` (public to read/reject; approve needs a signed-in client admin).
 * **NextAuth:** `auth.js` has a second Credentials provider `xero` that redeems the login code at `POST /xero/signup/session` and returns the same user shape as password login, so the rest of the app can't tell the difference.
 * Single-use secrets and React StrictMode: the views guard their on-mount calls with a `useRef` so a dev double-render doesn't burn a ticket/login code.

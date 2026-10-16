@@ -20,7 +20,7 @@ Backend implementation (Express + Mongoose). Code map:
    `https://<api-host>/api/v1/xero/callback` (`/api/xero/callback` also works; the router is mounted at both).
 3. Under *Webhooks*, set the delivery URL to `https://<api-host>/api/v1/xero/webhook`, subscribe to **Contacts** and **Invoices**, and copy the signing key into `XERO_WEBHOOK_KEY`. Xero sends an *intent to receive* check on save; the endpoint passes it only if the key is correct.
 4. Set the environment variables below and restart. Startup logs `[xero] background worker started` when the config is valid.
-5. In Dooit: Settings → Xero → **Connect Xero** (admin users only).
+5. In Dooit: Settings → Xero → **Connect to Xero** (admin users only), then **Finish setup** (expense account, tax rate, optional payments/customers). Nothing is sent until that is saved.
 
 ## 2. Environment variables
 
@@ -35,11 +35,13 @@ Backend implementation (Express + Mongoose). Code map:
 | `FRONTEND_URL` | for approval emails | Web base URL used in the emailed approval link (already used elsewhere in the API). Falls back to the origin of `XERO_SIGNUP_URL` |
 | `XERO_CONNECTION_REQUEST_TTL_MIN` | no | Minutes a client has to approve (default 30) |
 | `XERO_SIGNUP_URL` | for Sign up with Xero | Web page that finishes signup, e.g. `https://<web-host>/auth/xero`. The API callback redirects there with `?ticket=` / `?pending=` / `?loginCode=` / `?error=` |
-| `XERO_SCOPES` | no | Space/comma list. Default `offline_access accounting.contacts accounting.transactions accounting.settings`. `offline_access` is always enforced. **Apps created after Xero's granular-scope cut-over may need `accounting.invoices accounting.payments` instead of `accounting.transactions` — check your app's scope list.** |
-| `XERO_SALES_ACCOUNT_CODE` | no | Revenue account for invoice lines (default `200`) |
-| `XERO_PAYMENT_ACCOUNT_CODE` | for payments | Bank account code payments are applied to. Unset ⇒ outbound payments are skipped (logged) |
+| `XERO_SCOPES` | no | Space/comma list. Default (minimal, granular) `offline_access accounting.contacts accounting.invoices accounting.payments accounting.settings.read`. `offline_access` is always enforced. The broad `accounting.transactions` is deprecated and is not issued to apps created after 2 March 2026 (a startup warning flags it) |
+| `XERO_SUPPLIER_NAME` | recommended | How Dooit appears as the supplier on bills in the client's Xero — must match the name on Dooit invoices (`Dooit.ai`). Default `Dooit` |
+| `XERO_SUPPLIER_EMAIL` / `XERO_SUPPLIER_WEBSITE` / `XERO_SUPPLIER_TAX_NUMBER` | no | Supplier contact details (email falls back to `SUPPORT_EMAIL`). Set the tax number only once Dooit's ABN is confirmed |
 | `XERO_SYNC_INTERVAL_MIN` | no | Incremental sync cadence (default 15) |
 | `XERO_JOB_MAX_ATTEMPTS` | no | Retries before a job is parked as `dead` (default 5) |
+
+Account codes, the tax rate and the payment account are **not** environment settings: each organisation chooses them from its own chart of accounts in Settings → Xero (Xero certification). `XERO_SALES_ACCOUNT_CODE` / `XERO_PAYMENT_ACCOUNT_CODE` are ignored (startup warning).
 
 Validation (`validateXeroConfig`) runs at startup. No `XERO_*` set ⇒ integration disabled quietly. Partial/invalid config ⇒ errors logged, integration disabled, **API keeps running**.
 
@@ -73,6 +75,8 @@ Settings ─GET /xero/auth──────────────▶ API  cre
 | `GET /status` | admin | Org name, connected date, last sync, status, error |
 | `POST /sync` | admin | "Sync Now" — enqueues a full sync (202) |
 | `GET /logs` | admin | Recent sync log (`?status=failed&limit=50`) |
+| `GET /settings` | admin | Saved mapping + the organisation's live accounts, tax rates, payment accounts, currencies, deep links, problems |
+| `PUT /settings` | admin | Save the mapping (every code re-validated against Xero); queues a full sync |
 | `POST /webhook` | public (HMAC) | Xero webhook intake |
 
 RBAC: `protect` + `authorizeUserType(client, branch, dooit)` + `authorize("admin")`. Client/branch users act on their own company; dooit staff pass `?companyId=`. Tokens are never serialised (`select:false` + `toJSON` strip). All responses are `Cache-Control: no-store`; `helmet` is global.
@@ -113,16 +117,21 @@ A client can start from Xero (the App Store "Get this app" link → web `/auth/x
 
 | Dooit | Xero | Direction |
 |---|---|---|
-| Company (`Client`) | Contact | out; in (name/email/phone) |
-| Customer (individual KYC) | Contact | out; in (email/phone, plaintext fields only) |
-| Invoice (non-draft) | ACCREC Invoice | out; status/payments in |
-| Payment (`paid`, type `payment`) | Payment on the invoice | out; in (creates Dooit `Payment`, gateway `xero`) |
+| Dooit (`XERO_SUPPLIER_*`) | Supplier contact | out |
+| Customer (individual KYC) | Contact | out, **opt-in** per organisation; **KYC-verified only** — never pending/rejected, sanctioned, AML-flagged, offboarded or inactive. A synced customer who stops qualifying has their contact **archived**; restored if they qualify again. Same-name customers get separate contacts (`Name (DOOIT-C-xxxx)`), never merged |
+| Invoice (issued) | **Bill (ACCPAY)** from Dooit, coded to the mapped account + tax rate | out; bill status tracked in |
+| Invoice voided | Bill deleted (unapproved) / voided (approved) | out |
+| Payment (`paid`, type `payment`) | Payment on the approved bill, from the mapped account | out, **opt-in** |
 
-* **Idempotent:** `XeroEntityLink` stores the Xero id per (tenant, entity) with unique indexes. A SHA-256 of the mapped payload means unchanged entities make **no API call**. A duplicate-name error from Xero adopts the existing contact. Xero-originated payments are never echoed back.
-* **Order:** contacts → invoices → payments (each needs the previous one's Xero id). Invoices use `LineAmountTypes: NoTax` with Dooit's own discount/tax lines so totals match exactly.
-* **Not synced by design:** draft invoices; refunds (Xero models them as credit notes); inbound `VOIDED` invoices are logged for human review rather than auto-voiding (voiding releases usage records).
-* **PII safety:** masked (`***`) or ciphertext values are never sent to Xero, and inbound edits never overwrite encrypted Customer fields.
-* **Conflicts:** inbound contact changes apply only if Xero's `UpdatedDateUTC` is newer than the last synced version.
+The connected organisation is the **client's own** Xero, so Dooit is their supplier: Dooit invoices are bills in their books, never sales invoices. Inbound changes are **tracked, never applied** — a payment recorded in the client's Xero does not mark a Dooit invoice paid, and contact edits in Xero never change KYC records.
+
+* **Setup first:** nothing is sent until an admin saves the mapping (Settings → Xero). Before each sync the mapped account and tax rate are re-checked in Xero; if one was archived, bills pause with a clear message and the outbound cursor is held so nothing is skipped once fixed.
+* **Tax:** each line carries the mapped `TaxType` (`LineAmountTypes: Exclusive`) and Xero computes the tax; Dooit's tax amount is never posted. A bill is refused if the mapped rate differs from the rate on the Dooit invoice. Xero rounds tax per line, so a cent-level difference is posted as a rounding line to the organisation's ROUNDING account, and the created bill's total is checked against Dooit's.
+* **Idempotent:** `XeroEntityLink` stores the Xero id per (tenant, entity) with unique indexes. A SHA-256 of the mapped payload means unchanged entities make **no API call**; creates carry an `Idempotency-Key`. A duplicate-name error adopts the existing **active** contact.
+* **Order:** supplier contact → bills → payments. Payments wait until the client approves the bill in Xero.
+* **Multicurrency:** a bill is only created in a currency the organisation has enabled (`/Currencies`); otherwise the log says which currency to add.
+* **Not synced by design:** draft invoices; refunds (credit notes); a bill already paid in Xero is never force-voided (flagged instead).
+* **PII safety:** customers are opt-in; masked (`***`) or ciphertext values are never sent to Xero.
 * **Queue:** `XeroJob` (Mongo). Atomic claim, exponential back-off (30 s·2ⁿ), parked `dead` after max attempts or on auth errors, stale-lock recovery, deduplicated by key. A scheduled incremental sync runs per connection each `XERO_SYNC_INTERVAL_MIN`. "Sync Now" is a full sync; duplicate clicks collapse into one job and a running sync returns `alreadyRunning`.
 * **Audit:** every connect/refresh/disconnect/sync/webhook event is a `XeroSyncLog` row (actor, status, payload hash — never tokens or bodies; 1-year TTL).
 
@@ -145,14 +154,19 @@ A client can start from Xero (the App Store "Get this app" link → web `/auth/x
 | Approval email not received | `XERO_CONNECTION_REQUEST_EMAIL_SENT` with status `failed` in the sync log (SMTP). The request is closed so a retry works |
 | "already connected to another company" | That Xero org is bound to a different Dooit company; disconnect there first |
 | Webhook intent-to-receive fails | Wrong `XERO_WEBHOOK_KEY`, or a proxy altering the body/dropping `x-xero-signature` |
-| Payments never appear in Xero | `XERO_PAYMENT_ACCOUNT_CODE` unset, or invoice not yet synced — check `GET /logs?status=skipped` |
+| Nothing is sent to Xero | Mapping not saved yet (Settings → Xero → Finish setup) |
+| "Bills paused — the Xero mapping needs attention" | The mapped account/tax rate was archived or changed in Xero → choose again in Settings → Xero |
+| "…charged 10% — choose a matching tax rate" | The mapped Xero tax rate's rate differs from the GST on the Dooit invoice |
+| "…isn't enabled in your Xero organisation" | Add the invoice currency in Xero (Settings → Currencies), then Sync Now |
+| Payments never appear in Xero | Payments are opt-in, and only apply once the bill is approved in Xero |
+| Connection shows Reconnect though nobody disconnected in Dooit | The app was disconnected in Xero (Connected apps) or the connecting user lost access — Xero answered 403 `AuthenticationUnsuccessful` |
 | Invoice update rejected | Xero locks authorised invoices that have payments; only status can change |
 | Sync stuck "running" | Auto-clears after 30 min (crashed worker); `XeroJob` rows with `status: dead` hold the last error |
 | 429s | Xero limits: 60 calls/min/org, 5000/day — the client backs off; lower `XERO_SYNC_INTERVAL_MIN` frequency if persistent |
 
 ## 7. Frontend contract (Next.js app — not in this repo)
 
-Settings → Xero card: `GET /xero/status` (poll every 2–3 s while `syncing`), **Connect** → `GET /xero/auth` then `window.location = data.url`, **Sync Now** → `POST /xero/sync` (disable while `syncing`), **Disconnect** → `POST /xero/disconnect`. Show `tenantName`, `connectedAt`, `lastSyncAt`, `lastSyncStatus`, `lastSyncError`, `lastSyncSummary`; on `status: "revoked"` show *Reconnect*. Handle `?xero=` on return from the callback.
+Settings → Xero card: `GET /xero/status` (poll every 2–3 s while `syncing`), **Connect** → `GET /xero/auth` then `window.location = data.url`, **Sync Now** → `POST /xero/sync` (disable while `syncing`), **Disconnect** → `POST /xero/disconnect`. Show `tenantName`, `connectedAt`, `lastSyncAt`, `lastSyncStatus`, `lastSyncError`, `lastSyncSummary`; on `status: "revoked"` show *Reconnect*. Handle `?xero=` on return from the callback. Mapping card: `GET /xero/settings` (dropdown data — never free-text codes) → `PUT /xero/settings`; show `problems` and `setupComplete` from status.
 
 Developer deep-dive (architecture, recipes, runbook): [DEVELOPER_GUIDE.md](./DEVELOPER_GUIDE.md).
 

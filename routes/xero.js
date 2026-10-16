@@ -11,6 +11,8 @@ const {
   status,
   syncNow,
   logs,
+  getSettings,
+  saveSettings,
   webhook,
   signupStart,
   signupPrefill,
@@ -86,5 +88,7 @@ router.post("/disconnect", disconnect);
 router.get("/status", status);
 router.post("/sync", requireEnabled, syncNow);
 router.get("/logs", logs);
+router.get("/settings", requireEnabled, getSettings);
+router.put("/settings", requireEnabled, saveSettings);
 
 module.exports = router;
