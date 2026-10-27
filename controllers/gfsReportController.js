@@ -213,9 +213,19 @@ exports.updateGFS = asyncHandler(async (req, res, next) => {
 
   const body = normalizeInput(req.body || {});
 
+  // Fields the analyst actually changed become theirs: a re-draft from the
+  // case (Investigation Hub) must not overwrite them. The form re-sends every
+  // value, so only real changes count.
+  const { changedKeys, EDITABLE_FIELDS } = require("../services/reportDrafts");
+  delete body.editedFields;
+  const edited = changedKeys(gfs, body, EDITABLE_FIELDS.gfs);
+
   // merge updates
   const prevStatus = gfs.status;
   Object.assign(gfs, body);
+  if (edited.length) {
+    gfs.editedFields = [...new Set([...(gfs.editedFields || []), ...edited])];
+  }
   if (hasLinkageRef(body)) Object.assign(gfs, await linkageOverrides(body, "case"));
   gfs.metadata = gfs.metadata || {};
   gfs.metadata.updatedBy = req.user?.id || gfs.metadata.updatedBy;

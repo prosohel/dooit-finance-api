@@ -10,6 +10,8 @@ const {
   getCaseAlerts,
   getCaseReports,
   draftCaseReport,
+  saveCaseReportEdits,
+  suggestCaseReportNarrative,
   getCaseAnalysis,
   updateReviewWindow,
   getCaseInvestigation,
@@ -21,6 +23,8 @@ const {
   linkCustomers,
   unlinkCustomer,
   getPoiCandidates,
+  exportCasePdf,
+  duplicateCase,
   addPoi,
   updatePoi,
   removePoi,
@@ -77,6 +81,12 @@ router
   .get(authorizePermission('CASE.GET'), getCaseById)
   .put(authorizePermission('CASE.EDIT'), validateUpdateCase, updateCase)
   .delete(authorizePermission('CASE.DELETE'), deleteCase);
+
+// ── Printable Case Summary (?disposition=inline opens in the viewer) ──────────
+router.route('/:id/export-pdf').get(authorizePermission('CASE.GET'), exportCasePdf);
+
+// ── Duplicate: a fresh investigation over the same facts ──────────────────────
+router.route('/:id/duplicate').post(authorizePermission('CASE.ADD'), duplicateCase);
 
 // ── Status transition ─────────────────────────────────────────────────────────
 router
@@ -154,6 +164,16 @@ router.route('/:id/reports').get(authorizePermission('CASE.GET'), getCaseReports
 router
   .route('/:id/reports/:type/draft')
   .post(authorizePermission('CASE.EDIT'), draftCaseReport);
+
+// Analyst edits to that draft (whitelisted fields; tracked in editedFields)
+router
+  .route('/:id/reports/:type')
+  .patch(authorizePermission('CASE.EDIT'), saveCaseReportEdits);
+
+// Fresh AI prose, returned for the analyst to pick from — never saved here
+router
+  .route('/:id/reports/:type/suggest')
+  .post(authorizePermission('CASE.EDIT'), suggestCaseReportNarrative);
 
 // ── Record a SAR/SMR filing decision on the case ──────────────────────────────
 router.route('/:id/sar').post(authorizePermission('CASE.EDIT'), fileSAR);

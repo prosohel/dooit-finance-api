@@ -17,11 +17,16 @@ process.env.NODE_ENV = "development";
 const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 
+const { runWithRole } = require("../../utils/roleEncryptionPlugin");
+const { looksEncrypted } = require("../../utils/roleEncryptionPlugin");
+
 let mongod;
 let Case, Alert, Transaction, Customer, AuditLog, caseCtrl, validation;
 
-const call = (handler, { params = {}, query = {}, body = {}, user } = {}) =>
-  new Promise((resolve) => {
+// Runs inside a request context, as protect() would; `canRead` is the
+// caller's decrypt grant (roleEncryptionPlugin).
+const call = (handler, { params = {}, query = {}, body = {}, user, canRead = true } = {}) =>
+  new Promise((resolve) => runWithRole(user?.role || "admin", canRead, () => {
     const res = {
       statusCode: 200,
       body: null,
@@ -31,7 +36,7 @@ const call = (handler, { params = {}, query = {}, body = {}, user } = {}) =>
     const next = (e) => resolve({ res, err: e || null });
     const timer = setTimeout(() => resolve({ res, err: new Error("handler did not respond") }), 10000);
     Promise.resolve(handler({ params, query, body, user, headers: {}, ip: "127.0.0.1" }, res, next)).finally(() => clearTimeout(timer));
-  });
+  }));
 
 // Run a validator middleware; resolves to the error it passed to next (or null).
 const validate = (mw, body) => new Promise((resolve) => mw({ body }, {}, (e) => resolve(e || null)));
@@ -121,7 +126,10 @@ describe("POST /cases/:id/pois — manual entry", () => {
 
     const logs = await AuditLog.find({ case: caseDoc._id, action: "poi_added" }).lean();
     expect(logs).toHaveLength(1);
-    expect(logs[0].details).toMatch(/Mei Lin Chow.*manual entry/);
+    // The audit trail is not encrypted, so it must not carry the name.
+    expect(logs[0].details).toMatch(/^Person of interest [a-f\d]{24} \(associated_party, individual\) added \(manual entry\)$/);
+    expect(logs[0].details).not.toMatch(/Mei/);
+    expect(poi.dateOfBirth).toBe("1988-04-02");
   });
 
   test("the validator rejects a missing name, bad role, future DOB and a bad email", async () => {
@@ -285,5 +293,111 @@ describe("GET /cases/:id/poi-candidates", () => {
     expect(uids).toContain("CUS-MINE-1");
     expect(uids).not.toContain("CUS-FOREIGN-1");
     expect(res.body.data.customers.find((c) => c.uid === "CUS-MINE-1")).toMatchObject({ id: mine._id, alreadyPoi: false });
+  });
+});
+
+describe("encryption at rest", () => {
+  const add = (canRead = true) =>
+    call(caseCtrl.addPoi, {
+      params: { id: String(caseDoc._id) }, user, canRead,
+      body: {
+        name: "Mei Lin Chow", aliases: ["May Chow"], dateOfBirth: "1988-04-02",
+        idDocument: { type: "passport", number: "A1234567", country: "MY" },
+        email: "mei@example.com", phone: "+61 400 000 000", address: "1 George St",
+        account: "123-456 7890", notes: "Named in RFI", nationality: "MY",
+      },
+    });
+
+  test("identity fields are ciphertext in the database; the rest are not", async () => {
+    await add();
+    const raw = await Case.collection.findOne({ _id: caseDoc._id });
+    const [p] = raw.externalPois;
+    for (const v of [p.name, p.aliases[0], p.dateOfBirth, p.idDocument.number, p.email, p.phone, p.address, p.account, p.notes]) {
+      expect(looksEncrypted(v)).toBe(true);
+    }
+    expect(p.nationality).toBe("MY");
+    expect(p.idDocument.type).toBe("passport");
+  });
+
+  test("a caller without the decrypt grant sees *** ", async () => {
+    const { res } = await add(false);
+    const [p] = res.body.data.externalPois;
+    expect(p.name).toBe("***");
+    expect(p.idDocument.number).toBe("***");
+    expect(p.nationality).toBe("MY");
+  });
+
+  test("re-saving the case (e.g. linking an alert) keeps the ciphertext intact", async () => {
+    await add(false);
+    const hydrated = await Case.findById(caseDoc._id);
+    hydrated.title = "Renamed";
+    await hydrated.save();
+    const { res } = await call(caseCtrl.getPoiCandidates, { params: { id: String(caseDoc._id) }, user });
+    expect(res.statusCode).toBe(200);
+    const lean = await new Promise((r) => runWithRole("admin", true, () => Case.findById(caseDoc._id).lean().then(r)));
+    expect(lean.externalPois[0].name).toBe("Mei Lin Chow");
+    expect(lean.externalPois[0].aliases).toEqual(["May Chow"]);
+  });
+
+  test("a masked caller sending *** back does not overwrite the real values", async () => {
+    const { res } = await add();
+    const poiId = String(res.body.data.externalPois[0]._id);
+    await call(caseCtrl.updatePoi, {
+      params: { id: String(caseDoc._id), poiId }, user, canRead: false,
+      body: { name: "***", aliases: ["***"], idDocument: { type: "passport", number: "***" }, role: "subject" },
+    });
+    const lean = await new Promise((r) => runWithRole("admin", true, () => Case.findById(caseDoc._id).lean().then(r)));
+    expect(lean.externalPois[0]).toMatchObject({ name: "Mei Lin Chow", aliases: ["May Chow"], role: "subject" });
+    expect(lean.externalPois[0].idDocument.number).toBe("A1234567");
+  });
+
+  test("editing one field leaves the others decryptable", async () => {
+    const { res } = await add();
+    const poiId = String(res.body.data.externalPois[0]._id);
+    const upd = await call(caseCtrl.updatePoi, { params: { id: String(caseDoc._id), poiId }, user, body: { phone: "+61 411 111 111" } });
+    const [p] = upd.res.body.data.externalPois;
+    expect(p.phone).toBe("+61 411 111 111");
+    expect(p.name).toBe("Mei Lin Chow");
+    expect(p.idDocument.number).toBe("A1234567");
+  });
+});
+
+describe("tenancy", () => {
+  let foreign;
+  beforeEach(async () => {
+    foreign = await Customer.create({ country: "SG", relations: [{ client: OTHER_CLIENT, type: "individual" }] });
+    await Transaction.updateOne({ _id: txn._id }, { $set: { beneficiary: { customer: foreign._id, name: "Other Bank Customer", account: "SG-999" } } });
+  });
+
+  test("another tenant's customer on the transaction is offered only as an external party", async () => {
+    const { res } = await call(caseCtrl.getPoiCandidates, { params: { id: String(caseDoc._id) }, user });
+    const b = res.body.data.alerts[0].parties.find((p) => p.slot === "beneficiary");
+    expect(b.customer).toBeNull();
+    expect(b.name).toBe("Other Bank Customer");
+    expect(JSON.stringify(res.body)).not.toContain(String(foreign._id));
+  });
+
+  test("…and can be added as one", async () => {
+    const { res, err } = await call(caseCtrl.addPoi, {
+      params: { id: String(caseDoc._id) }, user,
+      body: { fromAlert: { alertId: String(alert._id), slot: "beneficiary" } },
+    });
+    expect(err).toBeNull();
+    expect(res.body.data.externalPois[0]).toMatchObject({ name: "Other Bank Customer", account: "SG-999" });
+  });
+
+  test("a platform admin cannot link another tenant's customer to this case", async () => {
+    const admin = { _id: user._id, name: "Platform", role: "admin" }; // no tenant
+    const { err } = await call(caseCtrl.linkCustomers, {
+      params: { id: String(caseDoc._id) }, user: admin, body: { customerIds: [String(foreign._id)] },
+    });
+    expect(err.statusCode).toBe(403);
+  });
+
+  test("linking an alert pulls in party customers of the case's tenant only", async () => {
+    const linking = require("../../services/caseLinking");
+    const ids = await linking.partyCustomersOf([txn._id], { clientId: CLIENT });
+    expect(ids).toEqual(expect.arrayContaining([String(subject._id), String(linkedCp._id)]));
+    expect(ids).not.toContain(String(foreign._id));
   });
 });

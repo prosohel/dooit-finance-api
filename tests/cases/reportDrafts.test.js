@@ -333,6 +333,64 @@ describe("aiReports.draftNarrative", () => {
     expect(meta.error.code).toBe("http_422");
     expect(meta.error.message).toContain("required data");
   });
+
+  // Observed live 27 Oct 2026: the model failed but the HTTP answer was 200,
+  // with bracketed apologies in the prose fields and the cause in
+  // `_meta.llm_section_errors`. None of that may reach a draft.
+  test("a 200 whose model failed keeps placeholders out and tells the analyst", async () => {
+    respond({
+      profile_summary: "[Profile summary could not be generated automatically.]",
+      transaction_analysis: "[Transaction analysis could not be generated automatically.]",
+      behavioral_analysis: "[Behavioral analysis could not be generated automatically.]",
+      recommendation: "[Recommendation could not be generated automatically.]",
+      recommendation_type: "RFI",
+      _meta: {
+        llm_section_errors: {
+          profile_summary: "LLMError: Gemini request failed.",
+          transaction_analysis: "LLMError: Gemini request failed.",
+          behavioral_analysis: "LLMError: Gemini request failed.",
+          recommendation: "LLMError: Gemini request failed.",
+          recommendation_narrative: "LLMError: Gemini request failed.", // not a field of ours
+        },
+      },
+    });
+    const { narrative, meta } = await aiReports.draftNarrative("ecdd", { caseId: "c1" });
+    expect(narrative.profileSummary).toBeUndefined();
+    expect(narrative.transactionAnalysis).toBeUndefined();
+    expect(narrative.recommendation).toBeUndefined();
+    expect(narrative.recommendationType).toBe("RFI"); // enum, not prose — kept
+    expect(meta.sectionsRejected).toEqual(
+      expect.arrayContaining(["profileSummary", "transactionAnalysis", "behavioralAnalysis", "recommendation"])
+    );
+    expect(meta.dataQuality.warnings[0]).toContain("The AI model failed for");
+    expect(meta.error.code).toBe("llm_failed"); // no prose survived → banner in the hub
+  });
+
+  test("a placeholder is dropped even without an llm_section_errors entry; partial failures stay warnings", async () => {
+    respond({
+      profile_summary: "[Profile summary could not be generated automatically.]",
+      behavioral_analysis: "Clean prose.",
+      _meta: { llm_section_errors: { profile_summary: "LLMError" } },
+    });
+    const { narrative, meta } = await aiReports.draftNarrative("ecdd", { caseId: "c1" });
+    expect(narrative.profileSummary).toBeUndefined();
+    expect(narrative.behavioralAnalysis).toBe("Clean prose.");
+    expect(meta.error.code).toBeNull(); // some prose survived → no hard error
+    expect(meta.dataQuality.warnings[0]).toContain("profileSummary");
+  });
+
+  // Observed live: GFS answers `suspicionSummary` but reports the failure as
+  // `suspicion_summary` — the match must ignore casing style.
+  test("an error key in another casing still disqualifies its section", async () => {
+    respond({
+      suspicionSummary: "[Grounds for suspicion summary could not be generated automatically.]",
+      _meta: { llm_section_errors: { suspicion_summary: "LLMError: Gemini request failed." } },
+    });
+    const { narrative, meta } = await aiReports.draftNarrative("gfs", { caseId: "c1" });
+    expect(narrative.suspicionSummary).toBeUndefined();
+    expect(meta.dataQuality.warnings[0]).toContain("suspicionSummary");
+    expect(meta.error.code).toBe("llm_failed");
+  });
 });
 
 /* ── ECDD ───────────────────────────────────────────────────────────────── */
@@ -908,5 +966,318 @@ describe("POST /cases/:id/reports/:type/draft", () => {
     rows = await AuditLog.find({ case: caseDoc._id }).lean();
     const redraft = rows.find((a) => a.action === "report_redrafted");
     expect(redraft.details).toContain("http_504");
+  });
+});
+
+/* ── persons of interest in the drafts (ECDD → GFS → SMR) ───────────────── */
+
+describe("persons of interest in drafts", () => {
+  const { runWithRole } = require("../../utils/roleEncryptionPlugin");
+  const draftAs = (type, canRead = true) =>
+    new Promise((resolve) => runWithRole("admin", canRead, () => draft(type, { regenerate: true }).then(resolve)));
+
+  beforeEach(async () => {
+    const linking = require("../../services/caseLinking");
+    const hydrated = await Case.findById(caseDoc._id);
+    const add = (input) => linking.addExternalPoi(hydrated, input, { user });
+    await add({ name: "Jane Director", role: "director", nationality: "AU", dateOfBirth: "1970-01-01",
+      idDocument: { type: "passport", number: "P123", country: "AU" }, phone: "+61 400 111 222" });
+    await add({ name: "Omar Owner", role: "beneficial_owner", nationality: "AE" });
+    await add({ name: "Mei Chow", role: "associated_party", relationship: "Sister" });
+    // The alert's counterparty, taken off the transaction.
+    await add({ fromAlert: { alertId: String(alert._id), slot: "sender" }, kind: "entity", registrationNumber: "NL-778" });
+  });
+
+  test("ECDD: owners, directors, related parties and the POI list", async () => {
+    stubAi("ecdd");
+    const { res, err } = await draftAs("ecdd");
+    expect(err).toBeNull();
+    const r = res.body.data;
+    expect(r.directors).toBe("Jane Director (AU)");
+    expect(r.beneficialOwner).toBe("Omar Owner (AE)");
+    expect(r.relatedParty).toMatch(/Mei Chow \(Associated party, Sister\)/);
+    expect(r.relatedParty).toMatch(/Sigma Logistics BV \(Counterparty\)/);
+    expect(r.personsOfInterest).toHaveLength(5);
+    expect(r.personsOfInterest[0]).toMatchObject({ name: "MOHAMMAD HOSSAIN", role: "Subject", source: "customer" });
+    expect(r.personsOfInterest.find((p) => p.name === "Sigma Logistics BV")).toMatchObject({ kind: "entity", source: "alert" });
+    // Identity detail stays on the case.
+    expect(JSON.stringify(r.personsOfInterest)).not.toContain("P123");
+  });
+
+  test("GFS: a recorded counterparty is one row, named by the POI; others are added", async () => {
+    stubAi("gfs");
+    const { res } = await draftAs("gfs");
+    const rows = res.body.data.pois;
+    expect(rows.filter((p) => p.account === "NL91ABNA0417164300")).toHaveLength(1);
+    expect(rows.find((p) => p.name === "Sigma Logistics BV").relationship).toBe("Counterparty");
+    expect(rows.find((p) => p.name === "Mei Chow").relationship).toBe("Associated party");
+    expect(rows.find((p) => p.name === "Jane Director").relationship).toBe("Director");
+  });
+
+  test("SMR Part D: recorded POIs with identity detail, counterparties not duplicated", async () => {
+    stubAi("smr");
+    const { res } = await draftAs("smr");
+    const parties = res.body.data.partD.otherParties;
+    const jane = parties.find((p) => p.name === "Jane Director");
+    expect(jane.personDetails.nationality).toBe("AU");
+    expect(new Date(jane.personDetails.dateOfBirth).toISOString().slice(0, 10)).toBe("1970-01-01");
+    expect(jane.identityVerification.documents[0]).toMatchObject({ type: "passport", number: "P123", country: "AU" });
+    expect(jane.phoneNumbers).toEqual(["+61 400 111 222"]);
+    expect(jane.isCustomer).toBe(false);
+
+    const sigma = parties.filter((p) => p.name === "Sigma Logistics BV");
+    expect(sigma).toHaveLength(1);
+    expect(sigma[0].documentation).toMatch(new RegExp(`Counterparty.*Registration NL-778.*identified from alert ${alert.uid}`));
+    // The subject stays in Part C, not D.
+    expect(parties.find((p) => p.name === "MOHAMMAD HOSSAIN")).toBeUndefined();
+  });
+
+  test("a drafter without the decrypt grant never freezes *** into a report", async () => {
+    stubAi("ecdd");
+    const { res } = await draftAs("ecdd", false);
+    expect(JSON.stringify(res.body.data)).not.toContain("***");
+    expect(res.body.data.personsOfInterest).toHaveLength(1); // only the customer — names were masked
+  });
+});
+
+/* ── editing a draft from the case (Investigation Hub narrative step) ───── */
+
+describe("PATCH /cases/:id/reports/:type and /suggest", () => {
+  const edit = (body, type = "ecdd") =>
+    call(caseCtrl.saveCaseReportEdits, { params: { id: String(caseDoc._id), type }, body, user });
+
+  beforeEach(async () => {
+    stubAi("ecdd");
+    await draft("ecdd");
+  });
+
+  test("saves only what changed, and marks it analyst-owned", async () => {
+    const stored = await EcddReport.findOne({ caseId: caseDoc._id }).lean();
+    const { res, err } = await edit({
+      directors: "Jane Director",
+      profileSummary: "Analyst's own summary.",
+      fullName: stored.fullName, // unchanged → not marked
+      onboardingDate: stored.onboardingDate.toISOString().slice(0, 10), // same day → not marked
+    });
+    expect(err).toBeNull();
+    expect(res.body.changed.sort()).toEqual(["directors", "profileSummary"]);
+    expect(res.body.data.editedFields.sort()).toEqual(["directors", "profileSummary"]);
+    expect(await AuditLog.countDocuments({ case: caseDoc._id, action: "report_edited" })).toBe(1);
+
+    // A second autosave inside the window does not add another audit line.
+    await edit({ directors: "Jane Director, Omar Owner" });
+    expect(await AuditLog.countDocuments({ case: caseDoc._id, action: "report_edited" })).toBe(1);
+  });
+
+  test("refuses fields outside the whitelist and types without editing", async () => {
+    expect((await edit({ caseId: String(new mongoose.Types.ObjectId()) })).err.statusCode).toBe(400);
+    expect((await edit({ alerts: [] })).err.statusCode).toBe(400);
+    expect((await edit({ itemsRationale: "x" }, "rfi")).err.statusCode).toBe(400);
+  });
+
+  test("a re-draft keeps edited facts AND edited prose; the rest refresh", async () => {
+    await edit({ directors: "Jane Director", profileSummary: "Analyst's own summary." });
+    await EcddReport.updateOne({ caseId: caseDoc._id }, { $set: { registeredAddress: "stale" } });
+
+    const { res } = await draft("ecdd", { regenerate: true });
+    const r = res.body.data;
+    expect(r.directors).toBe("Jane Director");
+    expect(r.profileSummary).toBe("Analyst's own summary.");
+    expect(r.transactionAnalysis).toBe(NARRATIVE.ecdd.transactionAnalysis); // AI-owned → refreshed
+    expect(r.registeredAddress).not.toBe("stale"); // fact not edited → recomputed
+  });
+
+  test("suggest returns fresh prose without saving it, and sends the POIs", async () => {
+    const hydrated = await Case.findById(caseDoc._id);
+    await require("../../services/caseLinking").addExternalPoi(hydrated, { name: "Mei Chow", role: "associated_party", relationship: "Sister" }, { user });
+
+    await edit({ profileSummary: "Mine." });
+    aiReports.draftNarrative.mockClear();
+    const { res, err } = await new Promise((resolve) =>
+      require("../../utils/roleEncryptionPlugin").runWithRole("admin", true, () =>
+        call(caseCtrl.suggestCaseReportNarrative, { params: { id: String(caseDoc._id), type: "ecdd" }, user }).then(resolve)
+      )
+    );
+    expect(err).toBeNull();
+    expect(res.body.data.narrative.profileSummary).toBe(NARRATIVE.ecdd.profileSummary);
+    expect((await EcddReport.findOne({ caseId: caseDoc._id }).lean()).profileSummary).toBe("Mine.");
+
+    const opts = aiReports.draftNarrative.mock.calls[0][1];
+    expect(opts.personsOfInterest).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "MOHAMMAD HOSSAIN", role: "Subject", is_customer: true }),
+        { name: "Mei Chow", role: "Associated party", relationship: "Sister", is_customer: false },
+      ])
+    );
+    // Identity numbers never go to the AI.
+    expect(JSON.stringify(opts.personsOfInterest)).not.toMatch(/dateOfBirth|idDocument|account/);
+  });
+});
+
+describe("aiReports sends persons_of_interest", () => {
+  test("in the request body when given", async () => {
+    jest.restoreAllMocks();
+    axios.post.mockResolvedValueOnce({ data: { profile_summary: "ok" } });
+    await aiReports.draftNarrative("ecdd", { caseId: "c1", personsOfInterest: [{ name: "A", role: "Subject" }] });
+    expect(axios.post.mock.calls.at(-1)[1].persons_of_interest).toEqual([{ name: "A", role: "Subject" }]);
+  });
+});
+
+describe("PUT /ecdd-report/:id (the standalone ECDD form)", () => {
+  test("records only the fields the analyst changed, so a re-draft keeps them", async () => {
+    stubAi("ecdd");
+    const { res } = await draft("ecdd");
+    const doc = res.body.data;
+    const ecddCtrl = require("../../controllers/ecddReportController");
+
+    // The form re-sends everything; only `directors` really changed.
+    const { err } = await call(ecddCtrl.updateEcddReport, {
+      params: { id: String(doc._id) }, user,
+      body: { fullName: doc.fullName, directors: "Board of Two", editedFields: ["bogus"] },
+    });
+    expect(err).toBeNull();
+    const stored = await EcddReport.findById(doc._id).lean();
+    expect(stored.editedFields).toEqual(["directors"]);
+
+    const redraft = await draft("ecdd", { regenerate: true });
+    expect(redraft.res.body.data.directors).toBe("Board of Two");
+  });
+});
+
+/* ── editing the GFS draft from the case (docs/74 phase C8) ──────────────── */
+
+describe("PATCH /cases/:id/reports/gfs and /suggest", () => {
+  const edit = (body) =>
+    call(caseCtrl.saveCaseReportEdits, { params: { id: String(caseDoc._id), type: "gfs" }, body, user });
+
+  beforeEach(async () => {
+    stubAi("gfs");
+    await draft("gfs");
+  });
+
+  test("saves only what changed, and marks it analyst-owned", async () => {
+    const stored = await GFS.findOne({ case: caseDoc._id }).lean();
+    const { res, err } = await edit({
+      additionalNotes: "Analyst note.",
+      suspicionSummary: "Analyst's own summary.",
+      customerName: stored.customerName, // unchanged → not marked
+      reviewStartDate: stored.reviewStartDate.toISOString().slice(0, 10), // same day → not marked
+    });
+    expect(err).toBeNull();
+    expect(res.body.changed.sort()).toEqual(["additionalNotes", "suspicionSummary"]);
+    expect(res.body.data.editedFields.sort()).toEqual(["additionalNotes", "suspicionSummary"]);
+    expect(await AuditLog.countDocuments({ case: caseDoc._id, action: "report_edited" })).toBe(1);
+  });
+
+  test("refuses fields outside the whitelist", async () => {
+    expect((await edit({ pois: [] })).err.statusCode).toBe(400);
+    expect((await edit({ netFlowAUD: 0 })).err.statusCode).toBe(400);
+    expect((await edit({ linkedToSMR: true })).err.statusCode).toBe(400);
+  });
+
+  test("a re-draft keeps edited facts AND edited prose; the rest refresh", async () => {
+    await edit({ suspicionSummary: "Analyst's own summary.", totalDeposited: 1 });
+    await GFS.updateOne({ case: caseDoc._id }, { $set: { occupation: "stale" } });
+
+    const { res } = await draft("gfs", { regenerate: true });
+    const r = res.body.data;
+    expect(r.suspicionSummary).toBe("Analyst's own summary."); // analyst-owned → kept
+    expect(r.totalDeposited).toBe(1); // edited fact → kept
+    expect(r.occupation).not.toBe("stale"); // fact not edited → recomputed
+  });
+
+  test("suggest returns fresh prose without saving it", async () => {
+    await edit({ suspicionSummary: "Mine." });
+    aiReports.draftNarrative.mockClear();
+    const { res, err } = await call(caseCtrl.suggestCaseReportNarrative, {
+      params: { id: String(caseDoc._id), type: "gfs" }, user,
+    });
+    expect(err).toBeNull();
+    expect(res.body.data.narrative.suspicionSummary).toBe(NARRATIVE.gfs.suspicionSummary);
+    expect((await GFS.findOne({ case: caseDoc._id }).lean()).suspicionSummary).toBe("Mine.");
+  });
+});
+
+describe("PUT /gfs-report/:id (the standalone GFS form)", () => {
+  test("records only the fields the analyst changed, so a re-draft keeps them", async () => {
+    stubAi("gfs");
+    const { res } = await draft("gfs");
+    const doc = res.body.data;
+    const gfsCtrl = require("../../controllers/gfsReportController");
+
+    // The form re-sends everything; only `occupation` really changed.
+    const { err } = await call(gfsCtrl.updateGFS, {
+      params: { id: String(doc._id) }, user,
+      body: { customerName: doc.customerName, occupation: "Baker", editedFields: ["bogus"] },
+    });
+    expect(err).toBeNull();
+    const stored = await GFS.findById(doc._id).lean();
+    expect(stored.editedFields).toEqual(["occupation"]);
+
+    const redraft = await draft("gfs", { regenerate: true });
+    expect(redraft.res.body.data.occupation).toBe("Baker");
+  });
+});
+
+/* ── editing the SMR draft from the case (docs/74 phase C9) ──────────────── */
+
+describe("PATCH /cases/:id/reports/smr (dotted AUSTRAC part paths)", () => {
+  const edit = (body) =>
+    call(caseCtrl.saveCaseReportEdits, { params: { id: String(caseDoc._id), type: "smr" }, body, user });
+
+  beforeEach(async () => {
+    stubAi("smr");
+    await draft("smr");
+  });
+
+  test("saves only what changed under a part, and marks the path analyst-owned", async () => {
+    const stored = await SMR.findOne({ caseId: caseDoc._id }).lean();
+    const { res, err } = await edit({
+      "partA.designatedServices": ["Account / deposit-taking services"],
+      "partB.groundsForSuspicion": "Analyst's own grounds.",
+      "partA.serviceStatus": stored.partA.serviceStatus, // unchanged → not marked
+    });
+    expect(err).toBeNull();
+    expect(res.body.changed.sort()).toEqual(["partA.designatedServices", "partB.groundsForSuspicion"]);
+    expect(res.body.data.editedFields.sort()).toEqual(["partA.designatedServices", "partB.groundsForSuspicion"]);
+    expect(res.body.data.partB.groundsForSuspicion).toBe("Analyst's own grounds.");
+  });
+
+  test("refuses evidence and provenance paths", async () => {
+    expect((await edit({ "partC.personOrganisation.name": "x" })).err.statusCode).toBe(400);
+    expect((await edit({ "partA.suspiciousIndicators.pep": false })).err.statusCode).toBe(400);
+    expect((await edit({ "partF.transactions": [] })).err.statusCode).toBe(400);
+    expect((await edit({ "partG.previousReports": [] })).err.statusCode).toBe(400);
+  });
+
+  test("a re-draft keeps edited paths — including inside a replaced subdocument — and refreshes the rest", async () => {
+    await edit({
+      "partB.groundsForSuspicion": "Analyst's own grounds.",
+      "partA.designatedServices": ["Digital currency exchange services"],
+      // reportingEntity is a subdocument the re-draft rebuilds wholesale — the
+      // edited leaf must survive that (reportDrafts setPath).
+      "partH.reportingEntity.completedBy.jobTitle": "MLRO",
+    });
+    await SMR.updateOne({ caseId: caseDoc._id }, { $set: { "partC.personOrganisation.occupation": "stale" } });
+
+    const { res } = await draft("smr", { regenerate: true });
+    const r = res.body.data;
+    expect(r.partB.groundsForSuspicion).toBe("Analyst's own grounds."); // analyst-owned → kept
+    expect(r.partB.groundsList).toEqual(NARRATIVE.smr.groundsList); // AI-owned → refreshed
+    expect(r.partA.designatedServices).toEqual(["Digital currency exchange services"]); // edited fact → kept
+    expect(r.partH.reportingEntity.completedBy.jobTitle).toBe("MLRO"); // survives subdoc rebuild
+    expect(r.partH.reportingEntity.name).toBe("Linkcaps"); // the rest of the subdoc refreshed
+    expect(r.partC.personOrganisation.occupation).not.toBe("stale"); // evidence → recomputed
+  });
+
+  test("suggest returns fresh Part B prose without saving it", async () => {
+    await edit({ "partB.groundsForSuspicion": "Mine." });
+    aiReports.draftNarrative.mockClear();
+    const { res, err } = await call(caseCtrl.suggestCaseReportNarrative, {
+      params: { id: String(caseDoc._id), type: "smr" }, user,
+    });
+    expect(err).toBeNull();
+    expect(res.body.data.narrative.groundsForSuspicion).toBe(NARRATIVE.smr.groundsForSuspicion);
+    expect((await SMR.findOne({ caseId: caseDoc._id }).lean()).partB.groundsForSuspicion).toBe("Mine.");
   });
 });

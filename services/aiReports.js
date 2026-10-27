@@ -93,6 +93,12 @@ const LIST_FIELDS = new Set([
 // never carry one, so any field containing this shape is dropped.
 const PII_TOKEN = /(⟨|<|\[\[|\{\{)\s*PII[_\-: ]/i;
 
+// When its model fails, the service still answers 200: the failed section
+// arrives as a bracketed apology ("[Profile summary could not be generated
+// automatically.]") and the cause sits in `_meta.llm_section_errors`. A
+// placeholder must never be saved as narrative (observed live 27 Oct 2026).
+const FAILURE_PLACEHOLDER = /^\[[^\]]*could not be generated[^\]]*\]$/i;
+
 /** "SMR" / "ongoing monitoring" / "no further action" → our enum (or null). */
 function normalizeRecommendationType(raw) {
   const s = String(raw || '').trim().toLowerCase();
@@ -114,14 +120,14 @@ function coerce(field, value) {
     const list = (Array.isArray(value) ? value : [value])
       .map((v) => String(v || '').trim())
       .filter(Boolean)
-      .filter((v) => !PII_TOKEN.test(v));
+      .filter((v) => !PII_TOKEN.test(v) && !FAILURE_PLACEHOLDER.test(v));
     return list.length ? list : null;
   }
 
   if (field === 'recommendationType') return normalizeRecommendationType(value);
 
   const text = String(value).trim();
-  if (!text || PII_TOKEN.test(text)) return null;
+  if (!text || PII_TOKEN.test(text) || FAILURE_PLACEHOLDER.test(text)) return null;
   return text;
 }
 
@@ -237,7 +243,10 @@ function errorMeta(code, message, { client, branch, requestedBy } = {}) {
  * @param {string} [opts.requestedBy] the user asking, for provenance
  * @returns {Promise<{narrative: Object, meta: Object}>}
  */
-async function draftNarrative(type, { caseId, alertId, dismissalType, client, branch, expected, requestedBy } = {}) {
+async function draftNarrative(
+  type,
+  { caseId, alertId, dismissalType, client, branch, expected, requestedBy, personsOfInterest } = {}
+) {
   const endpoint = ENDPOINTS[type];
   if (!endpoint) {
     return {
@@ -252,6 +261,13 @@ async function draftNarrative(type, { caseId, alertId, dismissalType, client, br
   // fields, so this changes nothing until the service scopes its own reads —
   // at which point every caller here is already sending what it needs (C15).
   if (client) body.client_id = String(client);
+  // Who the case is about (name / role / relationship — no identity numbers).
+  // The service reads customers from our database itself, but not the case's
+  // non-customer POIs (Case.externalPois, encrypted at rest), so they travel
+  // with the request. Ignored by the v2 contract until the service uses it.
+  if (Array.isArray(personsOfInterest) && personsOfInterest.length) {
+    body.persons_of_interest = personsOfInterest;
+  }
   if (branch) body.branch_id = String(branch);
   // Omitted entirely for 'generic' — the service defaults to it, and sending
   // the word back would be rejected as an unknown template code.
@@ -282,8 +298,18 @@ async function draftNarrative(type, { caseId, alertId, dismissalType, client, br
   const sectionsUsed = [];
   const sectionsRejected = [];
 
+  // Sections the service says its model failed on arrive as placeholder text
+  // under a 200 — never usable, whatever the value looks like. Its error keys
+  // do not always match its response keys (GFS answers `suspicionSummary` but
+  // reports `suspicion_summary`), so the comparison ignores case and casing.
+  const norm = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const failedKeys = new Set(Object.keys((data._meta || {}).llm_section_errors || {}).map(norm));
+  const failedFields = [];
+
   for (const [aiKey, field] of Object.entries(map)) {
-    const value = coerce(field, data[aiKey]);
+    const failed = failedKeys.has(norm(aiKey));
+    if (failed) failedFields.push(field);
+    const value = failed ? null : coerce(field, data[aiKey]);
     if (value === null) {
       // Only report a rejection when the service actually sent something.
       if (data[aiKey] !== undefined && data[aiKey] !== null) sectionsRejected.push(field);
@@ -293,10 +319,19 @@ async function draftNarrative(type, { caseId, alertId, dismissalType, client, br
     sectionsUsed.push(field);
   }
 
-  return {
-    narrative,
-    meta: buildMeta(data, { sectionsUsed, sectionsRejected, client, branch, expected, requestedBy }),
-  };
+  const meta = buildMeta(data, { sectionsUsed, sectionsRejected, client, branch, expected, requestedBy });
+  if (failedFields.length) {
+    meta.dataQuality.warnings.unshift(
+      `The AI model failed for ${failedFields.join(', ')} — write those sections yourself or redraft later.`
+    );
+    // No prose at all (an enum like recommendationType is not prose): tell the
+    // analyst the way an unreachable service would, so the hub shows its banner.
+    if (!sectionsUsed.some((f) => f !== 'recommendationType')) {
+      meta.error = { code: 'llm_failed', message: 'The AI model failed for every section', at: new Date() };
+    }
+  }
+
+  return { narrative, meta };
 }
 
 module.exports = {

@@ -120,6 +120,16 @@ const POI_KINDS = ['individual', 'entity'];
 const POI_ROLE_VALUES = ['subject', 'associated_party', 'counterparty', 'beneficiary', 'beneficial_owner', 'director', 'third_party', 'other'];
 const POI_SLOTS = ['sender', 'receiver', 'beneficiary', 'intermediary'];
 
+const POI_MAX_LENGTHS = {
+  name: 200,
+  'idDocument.number': 100,
+  address: 500,
+  email: 200,
+  phone: 50,
+  account: 100,
+  notes: 2000,
+};
+
 const validateExternalPoi = (isCreate) => (req, res, next) => {
   const b = req.body || {};
   const errors = [];
@@ -145,6 +155,14 @@ const validateExternalPoi = (isCreate) => (req, res, next) => {
     else if (dob > new Date()) errors.push('dateOfBirth cannot be in the future');
   }
   if (b.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.email)) errors.push('email must be a valid email address');
+  // Encrypted fields have no schema maxlength (ciphertext is longer than the
+  // value), so the limits are enforced here, on the plaintext.
+  for (const [key, max] of Object.entries(POI_MAX_LENGTHS)) {
+    const v = key === 'idDocument.number' ? b.idDocument?.number : b[key];
+    if (typeof v === 'string' && v.length > max) errors.push(`${key} cannot exceed ${max} characters`);
+  }
+  if (Array.isArray(b.aliases) && b.aliases.some((a) => String(a).length > 200))
+    errors.push('each alias cannot exceed 200 characters');
   if (b.aliases !== undefined && !Array.isArray(b.aliases)) errors.push('aliases must be an array');
   if (b.idDocument !== undefined && b.idDocument !== null && typeof b.idDocument !== 'object')
     errors.push('idDocument must be an object');

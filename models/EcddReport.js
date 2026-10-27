@@ -8,6 +8,24 @@ const { draftFields, ReportIpSchema } = require("./schemas/reportShared");
 
 const { Schema } = mongoose;
 
+// Who the ECDD is about: the case's customers and the non-customer persons of
+// interest the analyst recorded (Case.externalPois). Deliberately a summary —
+// identity details (DOB, ID numbers, accounts) stay on the case, encrypted.
+const EcddPoiSchema = new Schema(
+  {
+    customer: { type: Schema.Types.ObjectId, ref: "Customer", default: null },
+    poi: { type: String, default: null }, // Case.externalPois _id
+    kind: { type: String, default: null }, // individual | entity (external only)
+    name: { type: String, trim: true, default: "" },
+    role: { type: String, trim: true, default: "" },
+    relationship: { type: String, trim: true, default: "" },
+    nationality: { type: String, trim: true, default: "" },
+    country: { type: String, trim: true, default: "" },
+    source: { type: String, default: "" }, // customer | manual | alert
+  },
+  { _id: false }
+);
+
 const EcddReportSchema = new Schema(
   {
     // Auto-generated unique id for UI (e.g. #ECDD_001)
@@ -102,6 +120,7 @@ const EcddReportSchema = new Schema(
     isPEP: { type: String, enum: ["Yes", "No"], default: "No" },
     isSanctioned: { type: String, enum: ["Yes", "No"], default: "No" },
     relatedParty: { type: String, trim: true, default: "N/A" },
+    personsOfInterest: { type: [EcddPoiSchema], default: [] },
 
     // Transaction analysis — the review window and its AUD totals
     accountCreationDate: { type: Date, default: null },

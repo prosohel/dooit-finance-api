@@ -34,7 +34,13 @@ const {
 } = require('../services/caseLinking');
 const { searchCustomers } = require('../utils/customerSearch');
 const { analyseCase } = require('../services/caseAnalysis');
-const { draftReport, SUPPORTED_TYPES } = require('../services/reportDrafts');
+const {
+  draftReport,
+  saveReportEdits,
+  suggestNarrative,
+  SUPPORTED_TYPES,
+  EDITABLE_FIELDS,
+} = require('../services/reportDrafts');
 const { resolveCaseLinkage } = require('../utils/resolveCaseLinkage');
 const { isValidDismissalType, DISMISSAL_CODES } = require('../utils/dismissalTypes');
 const AlertDismissal = require('../models/AlertDismissal');
@@ -207,31 +213,34 @@ exports.getCaseById = asyncHandler(async (req, res, next) => {
   if (accessErr) return next(accessErr);
 
   // Related cases: other cases sharing a customer with this one (tenant-scoped).
-  let relatedCases = [];
+  // Runs alongside the approved-SMR check — neither depends on the other.
   const custIds = (caseDoc.linkedCustomers || []).map((c) => (c && c._id) || c).filter(Boolean);
-  if (custIds.length) {
-    const related = await Case.find({
-      _id: { $ne: caseDoc._id },
-      isDeleted: { $ne: true },
-      linkedCustomers: { $in: custIds },
-      ...(caseDoc.client ? { client: caseDoc.client } : {}),
-    })
-      .select('uid caseType type status')
-      .limit(10)
-      .lean();
-    relatedCases = related.map((c) => ({
-      _id: c._id,
-      caseId: c.uid,
-      caseType: c.caseType || c.type || '—',
-      status: c.status,
-    }));
-  }
+  const [related, approvedSmr] = await Promise.all([
+    custIds.length
+      ? Case.find({
+          _id: { $ne: caseDoc._id },
+          isDeleted: { $ne: true },
+          linkedCustomers: { $in: custIds },
+          ...(caseDoc.client ? { client: caseDoc.client } : {}),
+        })
+          .select('uid caseType type status')
+          .limit(10)
+          .lean()
+      : [],
+    caseDoc.decision === 'sar_filed'
+      ? true
+      : SMR.exists({ caseId: caseDoc._id, status: 'approved' }),
+  ]);
+  const relatedCases = related.map((c) => ({
+    _id: c._id,
+    caseId: c.uid,
+    caseType: c.caseType || c.type || '—',
+    status: c.status,
+  }));
 
   // Derived header stats (kept API-side so the UI never recomputes business rules).
   const netActivity = sumNetActivity(caseDoc.linkedTransactions);
-  const sarFiled =
-    caseDoc.decision === 'sar_filed' ||
-    !!(await SMR.exists({ caseId: caseDoc._id, status: 'approved' }));
+  const sarFiled = !!approvedSmr;
 
   // Regulatory filings (ECDD/SMR/TTR/IFTI/GFS/RFI) are served by
   // GET /cases/:id/reports — this endpoint stays the case document only.
@@ -239,6 +248,117 @@ exports.getCaseById = asyncHandler(async (req, res, next) => {
     succeed: true,
     data: { ...caseDoc, relatedCases, netActivity, sarFiled },
   });
+});
+
+// ── GET /cases/:id/export-pdf ────────────────────────────────────────────────
+// The printable Case Summary. Built from the same lean populated case the
+// detail endpoint serves, so the PDF can never show a role more than the
+// screen does (masked POI fields print as "***"). ?disposition=inline opens
+// it in the browser's viewer (the Print action); default is a download.
+exports.exportCasePdf = asyncHandler(async (req, res, next) => {
+  const { launchPdfBrowser } = require('../utils/puppeteerLaunch');
+  const { buildCaseSummaryHtml } = require('../services/caseSummaryDocument');
+
+  const caseDoc = await populateCase(
+    Case.findOne({ _id: req.params.id, isDeleted: { $ne: true } })
+  ).lean();
+  if (!caseDoc) {
+    return next(new ErrorResponse(`Case not found with id ${req.params.id}`, 404));
+  }
+  const accessErr = checkCaseAccess(caseDoc, req);
+  if (accessErr) return next(accessErr);
+
+  const html = buildCaseSummaryHtml(caseDoc, {
+    netActivity: sumNetActivity(caseDoc.linkedTransactions),
+    generatedBy: req.user?.name || '',
+  });
+
+  let browser;
+  try {
+    browser = await launchPdfBrowser();
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+
+    const pdfBuffer = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      displayHeaderFooter: true,
+      headerTemplate: '<div></div>',
+      footerTemplate:
+        '<div style="width:100%; font-size:7px; color:#8a8a8a; padding:0 13mm;' +
+        'font-family: Helvetica, Arial, sans-serif; display:flex; justify-content:space-between;">' +
+        '<span>Case ' +
+        String(caseDoc.uid || caseDoc._id).replace(/[<>&"']/g, '') +
+        '</span>' +
+        '<span>Page <span class="pageNumber"></span> of <span class="totalPages"></span></span>' +
+        '</div>',
+      margin: { top: '16mm', bottom: '18mm', left: '13mm', right: '13mm' },
+    });
+
+    const safeName = String(caseDoc.uid || caseDoc._id).replace(/[^A-Za-z0-9._-]/g, '_');
+    const disposition = req.query.disposition === 'inline' ? 'inline' : 'attachment';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `${disposition}; filename="CASE_${safeName}.pdf"`);
+    res.send(Buffer.from(pdfBuffer));
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
+// ── POST /cases/:id/duplicate ────────────────────────────────────────────────
+// A fresh investigation over the same facts: copies the classification, the
+// customer POIs and the linked transactions. Deliberately NOT copied — alerts
+// (an alert belongs to exactly one case), reports, notes, the audit trail,
+// investigation progress, and external POIs (their PII is encrypted per
+// record; a new case starts its own list).
+exports.duplicateCase = asyncHandler(async (req, res, next) => {
+  const source = await Case.findOne({ _id: req.params.id, isDeleted: { $ne: true } }).lean();
+  if (!source) {
+    return next(new ErrorResponse(`Case not found with id ${req.params.id}`, 404));
+  }
+  const accessErr = checkCaseAccess(source, req);
+  if (accessErr) return next(accessErr);
+
+  const copy = await Case.create({
+    title: `${source.title} (copy)`,
+    description: source.description,
+    type: source.type,
+    caseType: source.caseType,
+    priority: source.priority,
+    riskScore: source.riskScore,
+    riskLabel: source.riskLabel,
+    tags: source.tags,
+    client: source.client,
+    branch: source.branch,
+    customer: source.customer,
+    linkedCustomers: source.linkedCustomers,
+    linkedTransactions: source.linkedTransactions,
+    status: 'open',
+    createdBy: req.user._id,
+  });
+
+  const tenant = { client: copy.client || null, branch: copy.branch || null };
+  await Promise.all([
+    logAudit(
+      copy._id,
+      req.user._id,
+      'duplicated',
+      `Created as a duplicate of ${source.uid || source._id}`,
+      tenant,
+      req
+    ),
+    logAudit(
+      source._id,
+      req.user._id,
+      'duplicated',
+      `Duplicated to new case ${copy.uid}`,
+      tenant,
+      req
+    ),
+  ]);
+
+  const populated = await populateCase(Case.findById(copy._id)).lean();
+  res.status(201).json({ succeed: true, data: populated });
 });
 
 // ── POST /cases ───────────────────────────────────────────────────────────────
@@ -291,7 +411,10 @@ exports.createCase = asyncHandler(async (req, res, next) => {
 
   const mergedTransactions = [...new Set([...(linkedTransactions || []), ...alertTransactions.map(String)])];
   // Customers that are parties on those transactions are POIs too (doc 66 G13).
-  const partyCustomers     = await partyCustomersOf(mergedTransactions);
+  // Only this tenant's customers — the counterparty may bank with someone else.
+  const partyCustomers     = await partyCustomersOf(mergedTransactions, {
+    clientId: firstAlert?.client || tenant.client || null,
+  });
   const mergedCustomers    = [
     ...new Set([...(linkedCustomers || []), ...alertCustomers.map(String), ...partyCustomers]),
   ];
@@ -899,6 +1022,76 @@ exports.draftCaseReport = asyncHandler(async (req, res, next) => {
   res.status(created ? 201 : 200).json({ succeed: true, created, regenerated, data: report });
 });
 
+// Shared by the two narrative endpoints below: the case, access-checked, and
+// a type that supports editing from the case.
+const loadCaseForReportEdit = async (req, next) => {
+  const type = String(req.params.type || '').toLowerCase();
+  if (!EDITABLE_FIELDS[type]) {
+    next(new ErrorResponse(`type must be one of: ${Object.keys(EDITABLE_FIELDS).join(', ')}`, 400));
+    return null;
+  }
+  const caseDoc = mongoose.isValidObjectId(req.params.id)
+    ? await Case.findOne({ _id: req.params.id, isDeleted: { $ne: true } }).lean()
+    : null;
+  if (!caseDoc) {
+    next(new ErrorResponse(`Case not found with id ${req.params.id}`, 404));
+    return null;
+  }
+  const accessErr = checkCaseAccess(caseDoc, req);
+  if (accessErr) {
+    next(accessErr);
+    return null;
+  }
+  return { caseDoc, type };
+};
+
+// One audit line per analyst per report per window, not per autosave.
+const EDIT_AUDIT_WINDOW_MS = 15 * 60 * 1000;
+
+// ── PATCH /cases/:id/reports/:type ────────────────────────────────────────────
+// Save an analyst's edits to the case's draft (the Investigation Hub's
+// narrative step autosaves through here). Only whitelisted fields; each one
+// that changes joins `editedFields`, so a re-draft never overwrites it.
+exports.saveCaseReportEdits = asyncHandler(async (req, res, next) => {
+  const loaded = await loadCaseForReportEdit(req, next);
+  if (!loaded) return;
+  const { caseDoc, type } = loaded;
+
+  const { report, changed } = await saveReportEdits({ caseDoc, type, patch: req.body || {} });
+
+  if (changed.length) {
+    const action = 'report_edited';
+    const recent = await AuditLog.exists({
+      case: caseDoc._id,
+      user: req.user._id,
+      action,
+      details: new RegExp(`^${type.toUpperCase()} `),
+      createdAt: { $gte: new Date(Date.now() - EDIT_AUDIT_WINDOW_MS) },
+    });
+    if (!recent) {
+      await logAudit(
+        caseDoc._id, req.user._id, action,
+        `${type.toUpperCase()} ${report.uid || report._id} edited (${changed.join(', ')})`,
+        getTenant(req), req
+      );
+    }
+  }
+
+  res.status(200).json({ succeed: true, changed, data: report });
+});
+
+// ── POST /cases/:id/reports/:type/suggest ─────────────────────────────────────
+// Fresh AI prose for the case, returned and NOT saved — the analyst chooses
+// what to take, so a suggestion can never overwrite their words.
+exports.suggestCaseReportNarrative = asyncHandler(async (req, res, next) => {
+  const loaded = await loadCaseForReportEdit(req, next);
+  if (!loaded) return;
+  const { caseDoc, type } = loaded;
+
+  const { narrative, meta } = await suggestNarrative({ caseDoc, type, user: req.user });
+  res.status(200).json({ succeed: true, data: { narrative, meta } });
+});
+
 // ── GET /cases/analytics ────────────────────────────────────────────────────────
 // Tenant-scoped aggregates for the Case Manager dashboard (cards + charts).
 exports.getCaseAnalytics = asyncHandler(async (req, res, next) => {
@@ -1146,13 +1339,19 @@ exports.linkCustomers = asyncHandler(async (req, res, next) => {
   const accessErr = checkCaseAccess(caseDoc, req);
   if (accessErr) return next(accessErr);
 
-  // Every customer must exist and be related to the caller's tenant.
+  // Every customer must exist and belong to the CASE's tenant — not just the
+  // caller's: a platform admin has no tenant of their own, and checking only
+  // theirs let any tenant's customer be linked to any case.
   const tenant = getTenant(req);
   const customers = await Customer.find({ _id: { $in: customerIds } }).select('relations').lean();
   if (customers.length !== new Set(customerIds.map(String)).size) {
     return next(new ErrorResponse('One or more customerIds not found', 404));
   }
-  const foreign = customers.filter((c) => !customerRelatedToTenant(c, tenant.client, tenant.branch));
+  const foreign = customers.filter(
+    (c) =>
+      !customerRelatedToTenant(c, tenant.client, tenant.branch) ||
+      !customerRelatedToTenant(c, caseDoc.client, null)
+  );
   if (foreign.length) {
     return next(new ErrorResponse('One or more customers are not in your tenant', 403));
   }

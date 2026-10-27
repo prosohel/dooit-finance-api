@@ -240,4 +240,9 @@ function roleEncryptionPlugin(schema, options = {}) {
   };
 }
 
-module.exports = { roleEncryptionPlugin, runWithRole };
+/** Whether the current request may read decrypted values (false outside a request). */
+function canReadDecrypted() {
+  return !!_getStore().canReadDecrypted;
+}
+
+module.exports = { roleEncryptionPlugin, runWithRole, canReadDecrypted, looksEncrypted };

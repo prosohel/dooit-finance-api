@@ -31,6 +31,8 @@ const Transaction = require('../models/Transaction');
 const AuditLog = require('../models/AuditLog');
 const ErrorResponse = require('../utils/errorResponse');
 const { auditContext } = require('../utils/auditContext');
+const { customerRelatedToTenant } = require('../utils/customerTenantGuard');
+const { MASK } = require('../utils/poiCrypto');
 const { linkTransactionsToCase, unlinkTransactionsFromCase } = require('../utils/transactionCaseLink');
 const {
   normalizeRiskLabel,
@@ -88,10 +90,16 @@ const populateCase = (query) =>
       select: 'uid user personalKyc relations kycStatus isPep sanction country',
       populate: { path: 'user', select: 'name email photoUrl avatar' },
     })
-    .populate(
-      'linkedTransactions',
-      'uid amount currency convertedAmountAUD type status timestamp sender receiver riskScore riskFlags channel'
-    );
+    .populate({
+      path: 'linkedTransactions',
+      select:
+        'uid amount currency convertedAmountAUD type status timestamp sender receiver riskScore riskFlags channel',
+      // PartySchema.customer autopopulates by default, which would pull up to
+      // four FULL Customer documents (whole KYC blobs) per transaction into a
+      // payload that only ever reads the party's customer id. Biggest single
+      // cost of GET /cases/:id before this was turned off.
+      options: { autopopulate: false },
+    });
 
 // ── Audit row on the case (same shape caseController writes) ───────────────
 
@@ -112,10 +120,14 @@ const actorName = (user) => user?.name || (user?._id ? String(user._id) : 'syste
 
 /**
  * Every Customer referenced as a party on the given transactions.
+ * With `clientId`, only customers of that tenant: the other side of a payment
+ * can be another reporting entity's customer, and must not become a POI on
+ * (or be disclosed through) this tenant's case.
  * @param {Array} transactionIds
+ * @param {{clientId?:*}} [opts]
  * @returns {Promise<string[]>} unique customer ids
  */
-async function partyCustomersOf(transactionIds = []) {
+async function partyCustomersOf(transactionIds = [], { clientId = null } = {}) {
   const ids = uniqueIds(transactionIds);
   if (!ids.length) return [];
 
@@ -129,7 +141,21 @@ async function partyCustomersOf(transactionIds = []) {
       if (t[p] && t[p].customer) customers.push(t[p].customer);
     }
   }
-  return uniqueIds(customers);
+  const ids2 = uniqueIds(customers);
+  if (!clientId || !ids2.length) return ids2;
+  return uniqueIds(await inTenantCustomerIds(ids2, clientId));
+}
+
+/** The subset of `customerIds` related to tenant `clientId`. */
+async function inTenantCustomerIds(customerIds, clientId) {
+  const ids = uniqueIds(customerIds);
+  if (!clientId || !ids.length) return ids;
+  const rows = await mongoose
+    .model('Customer')
+    .find({ _id: { $in: ids }, 'relations.client': clientId })
+    .select('_id')
+    .lean();
+  return rows.map((r) => idStr(r._id));
 }
 
 // ── Risk derivation ─────────────────────────────────────────────────────────
@@ -281,7 +307,7 @@ async function attachAlertsToCase(caseDoc, alerts = [], { user, req, activityTit
   const txnIds = uniqueIds(fresh.map((a) => a.transaction));
   const customerIds = uniqueIds([
     ...fresh.map((a) => a.customer),
-    ...(await partyCustomersOf(txnIds)),
+    ...(await partyCustomersOf(txnIds, { clientId: caseDoc.client })),
   ]);
 
   const addedCustomerIds = customerIds.filter((c) => !includesId(caseDoc.linkedCustomers, c));
@@ -428,6 +454,9 @@ const EXTERNAL_POI_FIELDS = [
 // Identifiers copied off the transaction party; fixed for alert-sourced POIs.
 const ALERT_LOCKED_FIELDS = ['account', 'institution', 'institutionCountry', 'bic'];
 
+// "Person of interest 66f1… (counterparty, entity)" — no personal data.
+const poiLabel = (poi) => `Person of interest ${idStr(poi._id)} (${poi.role || 'associated_party'}, ${poi.kind || 'individual'})`;
+
 const pickPoiFields = (input = {}) => {
   const out = {};
   for (const k of EXTERNAL_POI_FIELDS) {
@@ -440,6 +469,12 @@ const pickPoiFields = (input = {}) => {
     out.idDocument = { type: type || null, number: number || null, country: country || null };
   }
   if (Array.isArray(out.aliases)) out.aliases = out.aliases.map((a) => String(a).trim()).filter(Boolean);
+  // Normalised BEFORE encryption — ciphertext cannot be lower-cased or parsed.
+  if (typeof out.email === 'string') out.email = out.email.trim().toLowerCase();
+  if (out.dateOfBirth) {
+    const d = new Date(out.dateOfBirth);
+    out.dateOfBirth = Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+  }
   return out;
 };
 
@@ -464,7 +499,10 @@ async function resolveAlertParty(caseDoc, { alertId, slot } = {}) {
   if (!party || (!party.name && !party.account)) {
     throw new ErrorResponse(`The transaction has no ${slot} party`, 400);
   }
-  if (party.customer) {
+  // An in-tenant customer goes through addCustomersToCase. Another tenant's
+  // customer is, from this case's side, an external party: record only what
+  // the transaction itself says about them.
+  if (party.customer && (await inTenantCustomerIds([party.customer], caseDoc.client)).length) {
     throw new ErrorResponse('This party is a customer — add them as a customer POI instead', 400);
   }
 
@@ -516,7 +554,8 @@ async function addExternalPoi(caseDoc, input = {}, { user, req } = {}) {
     provenance.source === 'alert'
       ? ` from alert ${provenance.sourceAlertUid || idStr(provenance.sourceAlert)} (${provenance.sourcePartySlot})`
       : ' (manual entry)';
-  await audit(caseDoc, user, 'poi_added', `Person of interest "${poi.name}" added${from}`, req);
+  // Audit rows are not encrypted: identify the POI by id and role, not name.
+  await audit(caseDoc, user, 'poi_added', `${poiLabel(poi)} added${from}`, req);
   return poi;
 }
 
@@ -526,6 +565,13 @@ async function updateExternalPoi(caseDoc, poiId, input = {}, { user, req } = {})
   if (!poi) throw new ErrorResponse('Person of interest not found on this case', 404);
 
   const fields = pickPoiFields(input);
+  // A caller without the decrypt grant was shown "***"; sending it back must
+  // not overwrite the real value.
+  for (const [k, v] of Object.entries(fields)) if (v === MASK) delete fields[k];
+  if (fields.idDocument && fields.idDocument.number === MASK) {
+    fields.idDocument.number = poi.idDocument?.number ?? null;
+  }
+  if (Array.isArray(fields.aliases) && fields.aliases.includes(MASK)) delete fields.aliases;
   // A POI taken off a transaction keeps that transaction's identifiers — they
   // are how the SMR ties the person back to the payment.
   if (poi.source === 'alert') {
@@ -538,18 +584,18 @@ async function updateExternalPoi(caseDoc, poiId, input = {}, { user, req } = {})
   await caseDoc.save();
 
   const changed = Object.keys(fields).join(', ') || 'no fields';
-  await audit(caseDoc, user, 'poi_updated', `Person of interest "${poi.name}" updated (${changed})`, req);
+  await audit(caseDoc, user, 'poi_updated', `${poiLabel(poi)} updated (${changed})`, req);
   return poi;
 }
 
 async function removeExternalPoi(caseDoc, poiId, { user, req } = {}) {
   const poi = caseDoc.externalPois.id(poiId);
   if (!poi) throw new ErrorResponse('Person of interest not found on this case', 404);
-  const { name } = poi;
+  const label = poiLabel(poi);
   poi.deleteOne();
   await caseDoc.save();
 
-  await audit(caseDoc, user, 'poi_removed', `Person of interest "${name}" removed`, req);
+  await audit(caseDoc, user, 'poi_removed', `${label} removed`, req);
   return { removedPoiId: idStr(poiId) };
 }
 
@@ -578,10 +624,15 @@ async function listAlertPoiCandidates(caseDoc) {
   const customers = await mongoose
     .model('Customer')
     .find({ _id: { $in: customerIds } })
-    .select('uid user kycStatus isPep sanction')
+    .select('uid user kycStatus isPep sanction relations')
     .populate('user', 'name')
     .lean();
-  const custById = new Map(customers.map((c) => [idStr(c._id), c]));
+  // Another tenant's customer is never described here — not even their uid.
+  const custById = new Map(
+    customers
+      .filter((c) => customerRelatedToTenant(c, caseDoc.client, null))
+      .map((c) => [idStr(c._id), c])
+  );
 
   const poiCustomerIds = new Set(uniqueIds([caseDoc.customer, ...(caseDoc.linkedCustomers || [])]));
   const describeCustomer = (id) => {
@@ -599,16 +650,17 @@ async function listAlertPoiCandidates(caseDoc) {
   return alerts.map((a) => {
     const t = txnById.get(idStr(a.transaction)) || null;
     const parties = [];
-    if (a.customer) {
+    if (a.customer && custById.has(idStr(a.customer))) {
       const c = describeCustomer(a.customer);
       parties.push({ slot: 'alert_subject', name: c.name, customer: c, alreadyPoi: poiCustomerIds.has(c.id) });
     }
     for (const slot of PARTY_PATHS) {
       const p = t && t[slot];
-      if (!p || (!p.customer && !p.name && !p.account)) continue;
+      const ownCustomer = p && p.customer && custById.has(idStr(p.customer));
+      if (!p || (!ownCustomer && !p.name && !p.account)) continue;
       // The alert's customer is usually also the sender or receiver — list them once.
-      if (p.customer && idStr(p.customer) === idStr(a.customer)) continue;
-      const customer = p.customer ? describeCustomer(p.customer) : null;
+      if (ownCustomer && idStr(p.customer) === idStr(a.customer)) continue;
+      const customer = ownCustomer ? describeCustomer(p.customer) : null;
       const external = customer
         ? null
         : (caseDoc.externalPois || []).find(

@@ -4,6 +4,7 @@ const mongoosePaginate = require('mongoose-paginate-v2');
 
 const { Schema } = mongoose;
 const { riskFields, slaFields, addOverdueVirtual } = require('./schemas/riskShared');
+const { encryptPoiDoc, decryptCasePoisLean } = require('../utils/poiCrypto');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Case document
@@ -56,6 +57,10 @@ const CaseDocumentSchema = new Schema(
 // linked alert's transaction ('alert'), or typed in ('manual'). For 'alert'
 // POIs the alert / transaction / party slot are kept so the same party cannot
 // be added twice and the SMR can cite where the name came from.
+//
+// Identity fields are ENCRYPTED at rest (utils/poiCrypto — name, aliases, DOB,
+// ID number, address, email, phone, account, notes). Their length limits live
+// in the request validator: ciphertext is longer than the value it holds.
 // ─────────────────────────────────────────────────────────────────────────────
 const POI_ROLES = [
     'subject',          // a subject of the suspicion in their own right
@@ -72,19 +77,20 @@ const POI_PARTY_SLOTS = ['sender', 'receiver', 'beneficiary', 'intermediary'];
 const ExternalPoiSchema = new Schema(
     {
         kind:         { type: String, enum: ['individual', 'entity'], default: 'individual' },
-        name:         { type: String, trim: true, required: [true, 'POI name is required'], maxlength: 200 },
-        aliases:      [{ type: String, trim: true, maxlength: 200 }],
+        name:         { type: String, trim: true, required: [true, 'POI name is required'] }, // encrypted
+        aliases:      [{ type: String, trim: true }],                                         // encrypted
         role:         { type: String, enum: POI_ROLES, default: 'associated_party' },
         // Free text: "Brother of the subject", "Receiving account holder".
         relationship: { type: String, trim: true, maxlength: 300, default: null },
 
         // ── Identity (individual) ──────────────────────────────────────────
-        dateOfBirth:  { type: Date, default: null },
+        // 'yyyy-mm-dd' — a string so it can hold ciphertext.
+        dateOfBirth:  { type: String, default: null },                                        // encrypted
         nationality:  { type: String, trim: true, maxlength: 100, default: null },
         occupation:   { type: String, trim: true, maxlength: 200, default: null },
         idDocument: {
             type:    { type: String, trim: true, maxlength: 60, default: null }, // passport, driver_licence …
-            number:  { type: String, trim: true, maxlength: 100, default: null },
+            number:  { type: String, trim: true, default: null },                       // encrypted
             country: { type: String, trim: true, maxlength: 100, default: null },
         },
 
@@ -93,17 +99,17 @@ const ExternalPoiSchema = new Schema(
 
         // ── Contact / location ─────────────────────────────────────────────
         country: { type: String, trim: true, maxlength: 100, default: null },
-        address: { type: String, trim: true, maxlength: 500, default: null },
-        email:   { type: String, trim: true, lowercase: true, maxlength: 200, default: null },
-        phone:   { type: String, trim: true, maxlength: 50, default: null },
+        address: { type: String, trim: true, default: null }, // encrypted
+        email:   { type: String, trim: true, default: null }, // encrypted (lower-cased before)
+        phone:   { type: String, trim: true, default: null }, // encrypted
 
         // ── Financial identifiers (mirrors Transaction PartySchema) ────────
-        account:            { type: String, trim: true, maxlength: 100, default: null },
+        account:            { type: String, trim: true, default: null }, // encrypted
         institution:        { type: String, trim: true, maxlength: 200, default: null },
         institutionCountry: { type: String, trim: true, maxlength: 100, default: null },
         bic:                { type: String, trim: true, maxlength: 20, default: null },
 
-        notes: { type: String, trim: true, maxlength: 2000, default: null },
+        notes: { type: String, trim: true, default: null }, // encrypted
 
         // ── Provenance ─────────────────────────────────────────────────────
         source:            { type: String, enum: ['manual', 'alert'], default: 'manual' },
@@ -331,11 +337,18 @@ CaseSchema.virtual('rfis',        { ref: 'RFI',        localField: '_id', foreig
 // counter, no plugin-ordering assumption and no second write, and matches how
 // every other record here mints a uid (TXN_, ECDD_, SMR_, GFS_, RFI_, DISM_,
 // NOTIFY_). The suffix is what makes two cases created in the same millisecond
-// safe against the unique index.
+// safe against the unique index: its first three digits rotate through a
+// process-local counter (so a batch minted in one process can never collide
+// with itself, docs/74 C27), the last three are random (so two processes
+// minting in the same millisecond almost never collide either — and the unique
+// index rejects the residual case).
+let uidSeq = Math.floor(Math.random() * 1000);
 CaseSchema.pre('save', function (next) {
     if (this.isNew && !this.uid) {
-        const suffix = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
-        this.uid = `CA-${Date.now()}-${suffix}`;
+        uidSeq = (uidSeq + 1) % 1000;
+        const seq = String(uidSeq).padStart(3, '0');
+        const rand = String(Math.floor(Math.random() * 1000)).padStart(3, '0');
+        this.uid = `CA-${Date.now()}-${seq}${rand}`;
     }
     next();
 });
@@ -350,6 +363,24 @@ CaseSchema.pre('save', function (next) {
 
 CaseSchema.plugin(uniqueValidator,  { message: '{PATH} must be unique.' });
 CaseSchema.plugin(mongoosePaginate);
+
+// External POI encryption (utils/poiCrypto): encrypt on every save; decrypt
+// only lean reads, which are output and never saved back.
+CaseSchema.pre('save', function (next) {
+    try {
+        (this.externalPois || []).forEach(encryptPoiDoc);
+        next();
+    } catch (err) {
+        next(err);
+    }
+});
+
+function decryptLeanPois(result) {
+    if (result && this.mongooseOptions().lean) decryptCasePoisLean(result);
+}
+CaseSchema.post('find', decryptLeanPois);
+CaseSchema.post('findOne', decryptLeanPois);
+CaseSchema.post('findOneAndUpdate', decryptLeanPois);
 
 // ─────────────────────────────────────────────────────────────────────────────
 

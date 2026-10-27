@@ -180,15 +180,21 @@ function buildCustomerName(c) {
  * Query:
  *   ?q=search
  *   ?limit=50
- *   ?client=clientId (optional filter by relation.client)
+ *   ?client=clientId (admins only — filter by relation.client)
  */
 exports.getCustomerDropdown = asyncHandler(async (req, res) => {
   const { q = "", limit = 50, client } = req.query;
   const { searchCustomers } = require("../utils/customerSearch");
+  // A tenant user is always pinned to their own client (and branch); only a
+  // platform user with no tenant may pick one. `?client=` used to override the
+  // caller's tenant, which listed other tenants' customers.
+  const ownClient = req.user?.client?._id || req.user?.clientBelongs || null;
+  const ownBranch = req.user?.branch?._id || req.user?.branchBelongs || null;
   const data = await searchCustomers({
     q,
     limit,
-    clientId: client || req.user?.client?._id || req.user?.clientBelongs,
+    clientId: ownClient || client || null,
+    branchId: ownClient ? ownBranch : null,
   });
   res.json({ success: true, count: data.length, data });
 });

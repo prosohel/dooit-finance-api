@@ -104,7 +104,7 @@ beforeEach(async () => {
 describe("case identity", () => {
   test("a created case gets a uid in the same write, with no counter involved", async () => {
     const created = await Case.create({ title: "Identified", createdBy: user._id });
-    expect(created.uid).toMatch(/^CA-\d{13}-\d{3}$/);
+    expect(created.uid).toMatch(/^CA-\d{13}-\d{6}$/);
 
     // It is on the document the caller holds AND in the database — the old
     // sequence-derived version produced neither (docs/74 C17).

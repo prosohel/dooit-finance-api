@@ -393,12 +393,23 @@ exports.updateEcddReport = asyncHandler(async (req, res, next) => {
   // Capture the pre-update status so a transition can be audited with its
   // before/after values (findByIdAndUpdate with new:true only returns "after").
   let prevStatus;
-  if (updateBody.status !== undefined) {
+  if (req.body.status !== undefined) {
     const prev = await EcddReport.findById(req.params.id)
       .select("status")
       .lean();
     prevStatus = prev?.status;
   }
+
+  // Fields the analyst actually changed become theirs: a re-draft from the
+  // case (Investigation Hub) must not overwrite them. The form re-sends every
+  // value, so only real changes count.
+  const { changedKeys, EDITABLE_FIELDS } = require("../services/reportDrafts");
+  const before = await EcddReport.findById(req.params.id).select(EDITABLE_FIELDS.ecdd.join(" ")).lean();
+  const { editedFields: _ignored, ...setBody } = updateBody;
+  const edited = before ? changedKeys(before, setBody, EDITABLE_FIELDS.ecdd) : [];
+  updateBody = edited.length
+    ? { $set: setBody, $addToSet: { editedFields: { $each: edited } } }
+    : setBody;
 
   const report = await EcddReport.findByIdAndUpdate(req.params.id, updateBody, {
     new: true,
@@ -415,7 +426,7 @@ exports.updateEcddReport = asyncHandler(async (req, res, next) => {
   }
 
   const statusChanged =
-    updateBody.status !== undefined && prevStatus !== report.status;
+    setBody.status !== undefined && prevStatus !== report.status;
   logEvent({
     req,
     service: "report",

@@ -27,6 +27,8 @@ const { analyseCase } = require('./caseAnalysis');
 const aiReports = require('./aiReports');
 const { idStr } = require('./caseLinking');
 const { suspicionReasonsForFlags } = require('../utils/smrFormOptions');
+const { MASK } = require('../utils/poiCrypto');
+const ErrorResponse = require('../utils/errorResponse');
 
 // A filing lists its transactions; it does not carry a ledger. Beyond this the
 // analyst works from the case's Transactions tab.
@@ -42,6 +44,86 @@ const subjectOf = (analysis) =>
   analysis.pois.find((p) => p.role === 'subject') || analysis.pois[0] || {};
 
 const yesNo = (value) => (value ? 'Yes' : 'No');
+
+/* ── Persons of interest (Case.externalPois) ────────────────────────────── */
+
+const POI_ROLE_LABELS = {
+  subject: 'Subject',
+  associated_party: 'Associated party',
+  counterparty: 'Counterparty',
+  beneficiary: 'Beneficiary',
+  beneficial_owner: 'Beneficial owner',
+  director: 'Director',
+  third_party: 'Third party',
+  other: 'Other',
+};
+
+// The case arrives lean, so its POIs are already decrypted — or masked "***"
+// when the drafting user has no decrypt grant. A mask must never be frozen
+// into a filing as if it were the person's name; it becomes blank instead.
+const clean = (v) => (v == null || v === MASK ? '' : String(v));
+
+/** The case's non-customer POIs, normalised for the report builders. */
+function externalPoisOf(caseDoc) {
+  return (caseDoc.externalPois || [])
+    .map((p) => ({
+      poiId: idStr(p._id),
+      kind: p.kind || 'individual',
+      name: clean(p.name),
+      aliases: (p.aliases || []).map(clean).filter(Boolean),
+      role: p.role || 'associated_party',
+      roleLabel: POI_ROLE_LABELS[p.role] || 'Associated party',
+      relationship: clean(p.relationship),
+      dateOfBirth: /^\d{4}-\d{2}-\d{2}$/.test(clean(p.dateOfBirth)) ? new Date(p.dateOfBirth) : null,
+      nationality: clean(p.nationality),
+      occupation: clean(p.occupation),
+      idDocument: {
+        type: clean(p.idDocument?.type),
+        number: clean(p.idDocument?.number),
+        country: clean(p.idDocument?.country),
+      },
+      registrationNumber: clean(p.registrationNumber),
+      country: clean(p.country),
+      address: clean(p.address),
+      email: clean(p.email),
+      phone: clean(p.phone),
+      account: clean(p.account),
+      institution: clean(p.institution),
+      institutionCountry: clean(p.institutionCountry),
+      bic: clean(p.bic),
+      source: p.source || 'manual',
+      sourceAlertUid: p.sourceAlertUid || null,
+    }))
+    .filter((p) => p.name);
+}
+
+/**
+ * Who the case is about, for the AI prompt: name, role and relationship only.
+ * No DOB, ID numbers or accounts — prose does not need them, and the service
+ * pseudonymises names before prompting.
+ */
+function poiContextForAi(caseDoc, analysis) {
+  return [
+    ...(analysis.pois || []).map((p) => ({
+      name: p.name || p.uid || '',
+      role: p.role === 'subject' ? 'Subject' : 'Linked customer',
+      relationship: '',
+      is_customer: true,
+    })),
+    ...externalPoisOf(caseDoc).map((p) => ({
+      name: p.name,
+      role: p.roleLabel,
+      relationship: p.relationship,
+      is_customer: false,
+    })),
+  ].filter((p) => p.name);
+}
+
+/** "Jane Doe (AU)" style one-liners for the ECDD free-text fields. */
+const poiOneLiner = (p) => {
+  const extra = [p.nationality || p.country, p.registrationNumber].filter(Boolean).join(', ');
+  return extra ? `${p.name} (${extra})` : p.name;
+};
 
 /** Alert evidence frozen as it stood when the draft was written. */
 const alertSnapshots = (alerts) =>
@@ -77,6 +159,9 @@ const reportAddress = (address = {}) => ({
 function buildEcddFacts({ caseDoc, analysis, user }) {
   const subject = subjectOf(analysis);
   const { totals, window } = analysis;
+  const external = externalPoisOf(caseDoc);
+  const withRole = (role) => external.filter((p) => p.role === role).map(poiOneLiner).join('; ');
+  const others = external.filter((p) => !['beneficial_owner', 'director'].includes(p.role));
 
   return {
     // who prepared it
@@ -98,7 +183,44 @@ function buildEcddFacts({ caseDoc, analysis, user }) {
     // screening flags
     isPEP: yesNo(subject.isPep),
     isSanctioned: yesNo(subject.sanction),
-    relatedParty: `${totals.relatedPartyTxnCount} related-party transaction(s) identified`,
+    relatedParty: [
+      `${totals.relatedPartyTxnCount} related-party transaction(s) identified`,
+      others.length
+        ? `other persons of interest: ${others.map((p) => `${p.name} (${[p.roleLabel, p.relationship].filter(Boolean).join(', ')})`).join('; ')}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join('; '),
+
+    // Beneficial owners / directors the analyst recorded as POIs.
+    beneficialOwner: withRole('beneficial_owner'),
+    directors: withRole('director'),
+
+    // Everyone the case is about, as the ECDD's subject list. Identity detail
+    // (DOB, ID numbers, accounts) stays on the case, encrypted — the report
+    // carries who and why, and the SMR carries the rest when one is filed.
+    personsOfInterest: [
+      ...analysis.pois.map((p) => ({
+        customer: p.customer || null,
+        kind: null,
+        name: p.name || p.uid || '',
+        role: p.role === 'subject' ? 'Subject' : 'Linked customer',
+        relationship: '',
+        nationality: '',
+        country: p.country || '',
+        source: 'customer',
+      })),
+      ...external.map((p) => ({
+        poi: p.poiId,
+        kind: p.kind,
+        name: p.name,
+        role: p.roleLabel,
+        relationship: p.relationship,
+        nationality: p.nationality,
+        country: p.country,
+        source: p.source,
+      })),
+    ],
 
     // review window + totals
     analysisStartDate: window.start,
@@ -131,6 +253,70 @@ function buildEcddFacts({ caseDoc, analysis, user }) {
 }
 
 /* ── SMR (docs/74 §4.2) ─────────────────────────────────────────────────── */
+
+const MAX_SMR_OTHER_PARTIES = 20;
+
+/** AUSTRAC SMR Part D rows for everyone on the case but the Part C subject. */
+function smrOtherParties(analysis, external, subject) {
+  const linkedCustomers = analysis.pois
+    .filter((p) => String(p.customer) !== String(subject.customer))
+    .map((p) => ({
+      name: p.name || p.uid || '',
+      personDetails: { dateOfBirth: p.dateOfBirth || null, nationality: p.country || '' },
+      businessAddress: reportAddress(p.residentialAddressParts),
+      phoneNumbers: [p.phone].filter(Boolean),
+      emails: [p.email].filter(Boolean),
+      occupation: p.occupation || '',
+      identityVerification: {
+        documents: p.identificationNumber ? [{ number: p.identificationNumber, country: p.country || '' }] : [],
+      },
+      isCustomer: true,
+    }));
+
+  const recorded = external.map((p) => ({
+    name: p.name,
+    otherNames: p.aliases,
+    personDetails:
+      p.kind === 'individual' ? { dateOfBirth: p.dateOfBirth, nationality: p.nationality } : undefined,
+    businessAddress: { street: p.address, country: p.country || p.institutionCountry },
+    phoneNumbers: [p.phone].filter(Boolean),
+    emails: [p.email].filter(Boolean),
+    accounts: p.account
+      ? [{ number: p.account, institution: p.institution, country: p.institutionCountry, bic: p.bic }]
+      : [],
+    occupation: p.occupation,
+    identityVerification: {
+      documents: p.idDocument.number
+        ? [{ type: p.idDocument.type, number: p.idDocument.number, country: p.idDocument.country }]
+        : [],
+    },
+    documentation: [
+      p.roleLabel,
+      p.relationship,
+      p.registrationNumber && `Registration ${p.registrationNumber}`,
+      p.source === 'alert' && p.sourceAlertUid && `identified from alert ${p.sourceAlertUid}`,
+    ]
+      .filter(Boolean)
+      .join('; '),
+    isCustomer: false,
+  }));
+
+  // A counterparty the analyst already recorded as a POI is that POI.
+  const recordedAccounts = new Set(external.map((p) => p.account).filter(Boolean));
+  const counterparties = analysis.counterparties
+    .filter((c) => !c.customer && !(c.account && recordedAccounts.has(c.account)))
+    .map((c) => ({
+      name: c.name || c.account || '',
+      businessAddress: { country: c.institutionCountry || '' },
+      accounts: c.account ? [{ number: c.account, institution: c.institution || '' }] : [],
+      isCustomer: false,
+    }));
+
+  // Named people first: they are why the matter is suspicious. Plain
+  // counterparties fill whatever room is left.
+  const otherParties = [...linkedCustomers, ...recorded, ...counterparties].slice(0, MAX_SMR_OTHER_PARTIES);
+  return { hasOtherParties: otherParties.length > 0, otherParties };
+}
 
 function buildSmrFacts({ caseDoc, analysis, alerts, client, user, previousReports }) {
   const subject = subjectOf(analysis);
@@ -174,16 +360,9 @@ function buildSmrFacts({ caseDoc, analysis, alerts, client, user, previousReport
       },
     },
 
-    // Everyone else on the case's transactions.
-    partD: {
-      hasOtherParties: analysis.counterparties.length > 0,
-      otherParties: analysis.counterparties.slice(0, 20).map((c) => ({
-        name: c.name || c.account || '',
-        businessAddress: { country: c.institutionCountry || '' },
-        accounts: c.account ? [{ number: c.account, institution: c.institution || '' }] : [],
-        isCustomer: !!c.customer,
-      })),
-    },
+    // Everyone else: the case's other customers, the POIs the analyst recorded
+    // (with their full identity detail) and the remaining counterparties.
+    partD: smrOtherParties(analysis, externalPoisOf(caseDoc), subject),
 
     partF: {
       transactions: analysis.transactions.slice(0, MAX_REPORT_TRANSACTIONS).map((t) => {
@@ -228,28 +407,17 @@ function buildSmrFacts({ caseDoc, analysis, alerts, client, user, previousReport
 
 /* ── GFS (docs/74 §4.3) ─────────────────────────────────────────────────── */
 
-const POI_ROLE_LABELS = {
-  subject: 'Subject',
-  associated_party: 'Associated party',
-  counterparty: 'Counterparty',
-  beneficiary: 'Beneficiary',
-  beneficial_owner: 'Beneficial owner',
-  director: 'Director',
-  third_party: 'Third party',
-  other: 'Other',
-};
-
 function gfsPois(caseDoc, analysis) {
-  const external = caseDoc.externalPois || [];
+  const external = externalPoisOf(caseDoc);
   const byAccount = new Map(external.filter((p) => p.account).map((p) => [p.account, p]));
   const matched = new Set();
 
   const counterparties = analysis.counterparties.map((c) => {
     const ext = c.account ? byAccount.get(c.account) : null;
-    if (ext) matched.add(String(ext._id));
+    if (ext) matched.add(ext.poiId);
     return {
       name: (ext && ext.name) || c.name || '',
-      relationship: ext ? POI_ROLE_LABELS[ext.role] || 'Counterparty' : 'Counterparty',
+      relationship: ext ? ext.roleLabel : 'Counterparty',
       country: c.institutionCountry || '',
       institution: c.institution || '',
       account: c.account || '',
@@ -267,11 +435,11 @@ function gfsPois(caseDoc, analysis) {
     })),
     ...counterparties,
     ...external
-      .filter((p) => !matched.has(String(p._id)))
+      .filter((p) => !matched.has(p.poiId))
       .map((p) => ({
-        id: String(p._id),
-        name: p.name || '',
-        relationship: POI_ROLE_LABELS[p.role] || 'Associated party',
+        id: p.poiId,
+        name: p.name,
+        relationship: p.roleLabel,
         country: p.country || p.nationality || p.institutionCountry || '',
         institution: p.institution || '',
         account: p.account || '',
@@ -446,6 +614,18 @@ function buildDismissalFacts({ caseDoc, analysis, alerts, alert, dismissalType, 
   };
 }
 
+/** Write `value` at a dotted `path` inside a plain payload object. */
+function setPath(obj, path, value) {
+  const parts = path.split('.');
+  const last = parts.pop();
+  let node = obj;
+  for (const p of parts) {
+    if (!node[p] || typeof node[p] !== 'object') node[p] = {};
+    node = node[p];
+  }
+  node[last] = value;
+}
+
 /* ── narrative application ──────────────────────────────────────────────── */
 
 /**
@@ -454,10 +634,12 @@ function buildDismissalFacts({ caseDoc, analysis, alerts, alert, dismissalType, 
  */
 function applyNarrative(type, payload, narrative, editedFields = []) {
   const applied = [];
-  const take = (key) => {
+  // `path` is the key as `editedFields` records it — the storage path for a
+  // nested field (SMR 'partB.groundsForSuspicion'), the key itself otherwise.
+  const take = (key, path = key) => {
     if (narrative[key] === undefined) return undefined;
-    if (editedFields.includes(key)) return undefined; // analyst owns it now
-    applied.push(key);
+    if (editedFields.includes(path)) return undefined; // analyst owns it now
+    applied.push(path);
     return narrative[key];
   };
 
@@ -473,11 +655,11 @@ function applyNarrative(type, payload, narrative, editedFields = []) {
 
   if (type === 'smr') {
     payload.partB = payload.partB || {};
-    const grounds = take('groundsForSuspicion');
+    const grounds = take('groundsForSuspicion', 'partB.groundsForSuspicion');
     if (grounds !== undefined) payload.partB.groundsForSuspicion = grounds;
-    const list = take('groundsList');
+    const list = take('groundsList', 'partB.groundsList');
     if (list !== undefined) payload.partB.groundsList = list;
-    const notes = take('investigationNotes');
+    const notes = take('investigationNotes', 'partB.investigationNotes');
     if (notes !== undefined) payload.partB.investigationNotes = notes;
   }
 
@@ -582,6 +764,7 @@ async function draftReport({ caseDoc, type, alertId, dismissalType, regenerate =
     client: caseDoc.client || null,
     branch: caseDoc.branch || null,
     requestedBy: user?._id || null,
+    personsOfInterest: poiContextForAi(caseDoc, analysis),
     expected: {
       transactions: analysis.totals.transactionCount,
       alerts: alerts.length,
@@ -668,6 +851,15 @@ async function draftReport({ caseDoc, type, alertId, dismissalType, regenerate =
 
   // 6. Persist.
   if (existing) {
+    // Anything the analyst edited is theirs — facts included, not only prose
+    // (applyNarrative already skipped edited prose). A dotted path cannot be
+    // deleted from the payload — `set()` may replace its whole subdocument
+    // (partH.reportingEntity) — so the analyst's stored value is carried into
+    // the payload instead.
+    for (const key of editedFields) {
+      if (key.includes('.')) setPath(payload, key, existing.get(key));
+      else delete payload[key];
+    }
     existing.set(payload);
     await existing.save();
     return { report: existing.toObject(), created: false, regenerated: true, analysis };
@@ -679,8 +871,142 @@ async function draftReport({ caseDoc, type, alertId, dismissalType, regenerate =
   return { report: report.toObject(), created: true, regenerated: false, analysis };
 }
 
+/* ── analyst editing (Investigation Hub narrative step) ─────────────────── */
+
+// What an analyst may change on a draft from the case, per type. Linkage,
+// evidence snapshots and provenance are never writable this way.
+const EDITABLE_FIELDS = {
+  ecdd: [
+    // 1. Analysis & review
+    'analystName', 'position', 'date',
+    // 2. Customer profile
+    'userId', 'fullName', 'customerName', 'abn', 'onboardingDate', 'accountPurpose',
+    'expectedVolumeText', 'annualIncome', 'beneficialOwner', 'directors', 'profileSummary',
+    // 3. Risk flags
+    'isPEP', 'isSanctioned', 'relatedParty',
+    // 4. Transaction analysis
+    'accountCreationDate', 'analysisStartDate', 'analysisEndDate', 'totalDepositsAUD',
+    'totalWithdrawalsAUD', 'totalWithdrawalsUSDT', 'totalWithdrawalsETH', 'totalWithdrawalsBTC',
+    'depositDetails', 'withdrawalDetails', 'transactionAnalysis', 'additionalInfo',
+    // 5. Behavioural analysis
+    'ipLocations', 'registeredAddress', 'behavioralAnalysis',
+    // 6. Recommendation
+    'recommendation', 'recommendationType', 'decisionRationale',
+    'immediateActions', 'keyIndicators', 'typologies',
+  ],
+  gfs: [
+    // 1. Suspicion
+    'suspicionType', 'suspicionReason', 'suspicionDates', 'suspicionIntensity',
+    'suspicionBehaviour', 'suspicionSummary',
+    // 2. Customer profile
+    'customerName', 'customerUID', 'companyName', 'customerAge', 'accountOpeningDate',
+    'occupation', 'customerCountry', 'residentialAddress', 'expectedTradingVolume',
+    'sourceOfFunds', 'sourceOfWealth', 'accountOpeningPurpose',
+    // 3. Review period & totals
+    'reviewStartDate', 'reviewEndDate', 'totalDeposited', 'totalWithdrawn',
+    'totalSuspicionAmount',
+    // 4. Behaviour & notes — `behavioralChange` (the boolean) stays derived (§4.3)
+    'behavioralChangeDescription', 'additionalNotes',
+  ],
+  // Dotted paths: the hub edits leaves of the AUSTRAC parts. The evidence
+  // parts (C subject, D other parties, F transactions, `suspiciousIndicators`)
+  // and `previousReports` are computed by us and stay API-owned (§4.2).
+  smr: [
+    // Part A — the reporting entity's own characterisation of the matter
+    'partA.designatedServices', 'partA.serviceStatus',
+    'partA.suspicionReasons', 'partA.otherReasons',
+    // Part B — the narrative
+    'partB.groundsForSuspicion', 'partB.groundsList', 'partB.investigationNotes',
+    // Parts D/E — the yes/no gates are the analyst's answer
+    'partD.hasOtherParties', 'partE.hasUnidentifiedPersons',
+    // Part G — the analyst's legal characterisation
+    'partG.likelyOffence',
+    // Part H — who completed the report
+    'partH.reportingEntity.internalReference',
+    'partH.reportingEntity.completedBy.name', 'partH.reportingEntity.completedBy.jobTitle',
+    'partH.reportingEntity.completedBy.phone', 'partH.reportingEntity.completedBy.email',
+  ],
+};
+
+const sameValue = (a, b) => {
+  const norm = (v) => (v instanceof Date ? v.toISOString() : v === undefined ? null : v);
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+};
+
+/**
+ * Fields in `patch` that actually change `doc` — a form that re-sends every
+ * value must not mark every field as analyst-owned.
+ */
+function changedKeys(doc, patch, allowed) {
+  return Object.keys(patch).filter((k) => {
+    if (!allowed.includes(k)) return false;
+    const current = doc.get ? doc.get(k) : doc[k];
+    const next = patch[k];
+    // Compare dates by their calendar day: the form speaks yyyy-mm-dd.
+    if (current instanceof Date && typeof next === 'string') {
+      return current.toISOString().slice(0, 10) !== next.slice(0, 10);
+    }
+    return !sameValue(current, next);
+  });
+}
+
+/**
+ * Save an analyst's edits to the case's draft. Only whitelisted fields are
+ * written, and each changed one joins `editedFields` so a later re-draft
+ * leaves it alone.
+ * @returns {Promise<{report:Object, changed:string[]}>}
+ */
+async function saveReportEdits({ caseDoc, type, patch = {} }) {
+  const allowed = EDITABLE_FIELDS[type];
+  if (!allowed) throw new ErrorResponse(`${type} drafts cannot be edited here`, 400);
+  const { Model, hubField } = REGISTRY[type];
+
+  const doc = await Model.findOne({ [hubField]: caseDoc._id }).sort({ createdAt: -1 });
+  if (!doc) throw new ErrorResponse(`This case has no ${REGISTRY[type].label} draft yet`, 404);
+
+  const unknown = Object.keys(patch).filter((k) => !allowed.includes(k));
+  if (unknown.length) throw new ErrorResponse(`Not editable here: ${unknown.join(', ')}`, 400);
+
+  const changed = changedKeys(doc, patch, allowed);
+  if (changed.length) {
+    for (const k of changed) doc.set(k, patch[k] === '' && doc.schema.path(k)?.instance === 'Date' ? null : patch[k]);
+    doc.editedFields = [...new Set([...(doc.editedFields || []), ...changed])];
+    await doc.save();
+  }
+  return { report: doc.toObject(), changed };
+}
+
+/**
+ * Fresh AI prose for the case — returned, NOT saved. The analyst picks what
+ * to keep, so a suggestion can never overwrite their words.
+ */
+async function suggestNarrative({ caseDoc, type, user }) {
+  const cached = caseDoc.analysis || {};
+  const analysis =
+    cached.snapshot && cached.computedAt && new Date(cached.computedAt) >= new Date(caseDoc.updatedAt)
+      ? cached.snapshot
+      : await analyseCase(caseDoc);
+  const { narrative, meta } = await aiReports.draftNarrative(type, {
+    caseId: caseDoc._id,
+    client: caseDoc.client || null,
+    branch: caseDoc.branch || null,
+    requestedBy: user?._id || null,
+    personsOfInterest: poiContextForAi(caseDoc, analysis),
+    expected: {
+      transactions: analysis.totals.transactionCount,
+      alerts: (caseDoc.linkedAlerts || []).length,
+      sharedCustomers: analysis.tenancy?.poisSharedWithOtherClients ?? 0,
+    },
+  });
+  return { narrative, meta };
+}
+
 module.exports = {
   draftReport,
+  saveReportEdits,
+  suggestNarrative,
+  EDITABLE_FIELDS,
+  changedKeys,
   SUPPORTED_TYPES,
   REGISTRY,
   // exported for tests

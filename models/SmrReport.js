@@ -292,6 +292,8 @@ const SMRSpec = new Schema(
 // pre-save uid
 // Tenant-scoped list queries
 SMRSpec.index({ client: 1, status: 1, createdAt: -1 });
+// getCaseById's approved-SMR existence check, and per-case report listings
+SMRSpec.index({ caseId: 1, status: 1 });
 
 SMRSpec.pre("save", function (next) {
   if (this.isNew && !this.uid) this.uid = `SMR_${Date.now()}`;
