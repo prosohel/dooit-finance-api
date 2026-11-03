@@ -111,6 +111,8 @@ const payment = require("./payment");
 router.use("/fileupload", fileUpload);
 router.use("/file-vault", fileVault);
 router.use("/auth", auth);
+router.use("/afc-os", require("./afc-os")); // connector to the regulator's AFC OS (client credentials server-side)
+router.use("/exchange", require("./exchange")); // cross-platform event hub (AFC OS ↔ portal / GRC / BFIU)
 router.use("/otp", otp);
 router.use("/user", user);
 router.use("/role", role);

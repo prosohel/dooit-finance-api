@@ -14,7 +14,8 @@ const POPULATE_ISSUE = [
 // ── GET /issue ────────────────────────────────────────────────────────────────
 exports.getIssues = asyncHandler(async (req, res) => {
   const { domain, severity, status, source, search, page = 1, limit = 20 } = req.query;
-  const client = req.user?.client?._id;
+  // The tenant: the user's own client, or the active membership's (a regulator seat opened by handoff has no User.client).
+  const client = req.user?.client?._id ?? req.user?.clientBelongs ?? null;
 
   const filter = { client };
   if (domain)   filter.domain   = domain;
@@ -44,7 +45,8 @@ exports.getIssues = asyncHandler(async (req, res) => {
 
 // ── GET /issue/summary ────────────────────────────────────────────────────────
 exports.getIssueSummary = asyncHandler(async (req, res) => {
-  const client = req.user?.client?._id;
+  // The tenant: the user's own client, or the active membership's (a regulator seat opened by handoff has no User.client).
+  const client = req.user?.client?._id ?? req.user?.clientBelongs ?? null;
 
   const [statusCounts, severityCounts] = await Promise.all([
     IssueRegister.aggregate([
@@ -82,7 +84,8 @@ exports.getIssue = asyncHandler(async (req, res, next) => {
 
 // ── POST /issue ───────────────────────────────────────────────────────────────
 exports.createIssue = asyncHandler(async (req, res) => {
-  const client = req.user?.client?._id;
+  // The tenant: the user's own client, or the active membership's (a regulator seat opened by handoff has no User.client).
+  const client = req.user?.client?._id ?? req.user?.clientBelongs ?? null;
   const doc = await IssueRegister.create({
     ...req.body,
     client,
@@ -138,7 +141,8 @@ exports.getTasks = asyncHandler(async (req, res) => {
 
 // POST /issue/:id/tasks
 exports.createTask = asyncHandler(async (req, res) => {
-  const client = req.user?.client?._id;
+  // The tenant: the user's own client, or the active membership's (a regulator seat opened by handoff has no User.client).
+  const client = req.user?.client?._id ?? req.user?.clientBelongs ?? null;
   const task = await RemediationTask.create({
     ...req.body,
     issue:     req.params.id,

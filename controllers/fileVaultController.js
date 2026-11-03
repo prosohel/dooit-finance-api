@@ -41,7 +41,16 @@ exports.uploadFile = asyncHandler(async (req, res, next) => {
 
   const { buffer, originalname, mimetype } = req.file;
 
-  const result = await fileVaultService.uploadFile(buffer, originalname, mimetype);
+  let result;
+  try {
+    result = await fileVaultService.uploadFile(buffer, originalname, mimetype);
+  } catch (err) {
+    // The vault is an external service: report its answer, never the raw axios error (which is circular and crashed res.json).
+    const status = err.response?.status ?? 502;
+    const detail = err.response?.data?.message ?? err.response?.data?.error ?? err.message;
+    logEvent({ req, service: "file", action: "file_upload_failed", status: "failure", target: originalname, details: String(detail) });
+    return next(new ErrorResponse(`File vault upload failed: ${detail}`, status >= 500 ? 502 : status));
+  }
 
   logEvent({ req, service: "file", action: "file_uploaded", target: originalname });
 
