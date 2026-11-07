@@ -130,6 +130,20 @@ exports.fileForAfcOs = asyncHandler(async (req, res, next) => {
 //          return the vault id, so AFC OS keeps the same `vault://files/<id>` reference as portal uploads.
 // @route   POST /api/v1/afc-os/files   multipart: file
 // @access  Exchange signature (afcos | bfiu)
+// @route DELETE /api/v1/afc-os/files/:id — retention purge from AFC OS (signed service call)
+exports.fileDeleteForAfcOs = asyncHandler(async (req, res, next) => {
+  if (!req.exchangeCaller?.service) return next(new ErrorResponse("Only a signed service call may delete vault files", 403));
+  if (!/^[0-9a-f]{24}$/i.test(String(req.params.id))) return next(new ErrorResponse("Not a vault file id", 400));
+  try {
+    await fileVaultService.deleteFile(req.params.id);
+  } catch (err) {
+    const status = err.response?.status ?? 502;
+    return next(new ErrorResponse(status === 404 ? "File not found in the vault" : `File vault unavailable: ${err.message}`, status === 404 ? 404 : 502));
+  }
+  logEvent?.({ req, service: "afc-os", action: "file_purged", target: { kind: "FileVault", id: req.params.id }, details: req.exchangeCaller.app });
+  res.status(200).json({ success: true, data: { id: req.params.id } });
+});
+
 exports.fileStoreForAfcOs = asyncHandler(async (req, res, next) => {
   if (!req.exchangeCaller?.service) return next(new ErrorResponse("Only a signed service call may store vault files", 403));
   if (!req.file) return next(new ErrorResponse("Please upload a file", 400));

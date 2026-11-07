@@ -15,7 +15,10 @@
     "test:rule-engine": "jest --testPathPatterns=tests/rule-engine --runInBand --forceExit",
     "test:alerts": "jest --testPathPatterns=tests/alerts --runInBand --forceExit",
     "test:cases": "jest --testPathPatterns=tests/cases --runInBand --forceExit",
-    "test:workflow": "jest --testPathPatterns=tests/workflow --runInBand --forceExit"
+    "test:workflow": "jest --testPathPatterns=tests/workflow --runInBand --forceExit",
+    "test:exchange": "jest --testPathPatterns=tests/exchange --runInBand --forceExit",
+    "test:tm-seed": "jest --testPathPatterns=tests/tm-seed --runInBand --forceExit",
+    "seed:tm": "node seeds/seedTmTransactions.js"
   },
   "jest": {
     "testEnvironment": "node",

@@ -2,6 +2,13 @@
 const express = require("express");
 const router = express.Router();
 
+// Liveness for load balancers and container health checks (deploy/docker-compose.yml).
+// Public and data-free: it only says whether this process is up and connected to Mongo.
+router.get("/health", (req, res) => {
+  const up = require("mongoose").connection.readyState === 1;
+  res.status(up ? 200 : 503).json({ ok: up, service: "platform-api", at: new Date().toISOString() });
+});
+
 // Import individual route files
 const fileUpload = require("./fileupload");
 const fileVault = require("./fileVault");

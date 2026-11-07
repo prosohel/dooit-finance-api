@@ -8,9 +8,14 @@
  * event still counts as delivered — the GRC inbox shows it regardless.
  *
  *   submission.accepted  → one IssueRegister row per accepted gap (docs/77 §1:
- *                           "the GRC Platform turns them into issues")
+ *                           "the GRC Platform turns them into issues"), one
+ *                           RemediationTask per row (the proposed fix, due on the
+ *                           officer's date), and `submission.issues_opened` back
+ *                           to AFC OS so each gap shows its issue / task
  */
 const IssueRegister = require("../models/IssueRegister");
+const RemediationTask = require("../models/RemediationTask");
+const { emitPlatformEvent } = require("./exchangeEmit");
 
 const SEVERITY = { high: "High", medium: "Medium", low: "Low", critical: "Critical" };
 
@@ -33,10 +38,11 @@ async function projectSubmissionAccepted(event) {
   const gaps = Array.isArray(p.gaps) ? p.gaps : [];
   const dueDate = new Date(Date.now() + Number(p.due_in_days ?? 60) * 86_400_000);
   let created = 0;
+  const opened = [];
   for (const g of gaps) {
     const key = `afcos:${p.submission_id}:${g.gap_id}`;
     if (await IssueRegister.exists({ client, tags: key })) continue; // re-delivery
-    await IssueRegister.create({
+    const issue = await IssueRegister.create({
       client,
       title: g.text?.slice(0, 180) || `Gap ${g.gap_id} on ${p.submission_id}`,
       description: [g.proposed_fix ? `Proposed fix: ${g.proposed_fix}` : null, g.obligation_id ? `Obligation: ${g.obligation_id}` : null, `Raised by Bangladesh Bank (MLTFPD) from submission ${p.submission_id}, gap ${g.gap_id}.`].filter(Boolean).join("\n"),
@@ -48,9 +54,30 @@ async function projectSubmissionAccepted(event) {
       notes: `Exchange event ${event.eventId}`,
       tags: ["afc-os", "mltfpd", p.submission_id, g.gap_id, key].filter(Boolean),
     });
+    // The first remediation task is the regulator's proposed fix; the RO's GRC team can add more.
+    const task = await RemediationTask.create({
+      client,
+      issue: issue._id,
+      title: (g.proposed_fix || `Remediate ${g.gap_id}: ${g.text ?? ""}`).slice(0, 180),
+      description: `Remediation of gap ${g.gap_id} on ${p.submission_id}${g.obligation_id ? ` (obligation ${g.obligation_id})` : ""}. Mark it completed once the evidence is attached to the issue; Bangladesh Bank (MLTFPD) sees every status change on its side.`,
+      priority: SEVERITY[String(g.severity ?? "medium").toLowerCase()] ?? "Medium",
+      status: "Open",
+      dueDate,
+      notes: key,
+    });
+    opened.push({ gap_id: g.gap_id, issue_id: issue.issueId, issue: String(issue._id), task_id: task.taskId, task: String(task._id), due_date: dueDate });
     created += 1;
   }
-  return { ok: true, note: `${created} issue(s) opened from ${gaps.length} accepted gap(s)` };
+  if (opened.length) {
+    await emitPlatformEvent({
+      type: "submission.issues_opened",
+      client,
+      subject: { kind: "Submission", uid: p.submission_id },
+      payload: { submission_id: p.submission_id, gaps: opened, due_date: dueDate },
+      idempotencyKey: `grc:issues_opened:${event.eventId}`,
+    });
+  }
+  return { ok: true, note: `${created} issue(s) and task(s) opened from ${gaps.length} accepted gap(s)` };
 }
 
 const PROJECTIONS = {

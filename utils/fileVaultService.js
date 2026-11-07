@@ -54,11 +54,20 @@ const createClient = (extraHeaders = {}) => {
  * @param {string}  mimetype     – MIME type  (e.g. "application/pdf")
  * @returns {Promise<{ success, data }>}
  */
+/**
+ * The vault refuses `text/*` uploads (500) but takes Office types. Customer data
+ * dumps arrive as CSV from browsers (`text/csv`), so they are stored under the
+ * Excel media type Windows itself registers for .csv; the caller keeps the
+ * original type on its own record.
+ */
+const VAULT_MIME = { "text/csv": "application/vnd.ms-excel", "application/csv": "application/vnd.ms-excel", "text/comma-separated-values": "application/vnd.ms-excel" };
+const vaultMimeOf = (mimetype) => VAULT_MIME[String(mimetype ?? "").toLowerCase()] ?? mimetype;
+
 exports.uploadFile = async (buffer, originalName, mimetype) => {
   const { baseURL, apiKey } = getConfig();
 
   const form = new FormData();
-  form.append("file", buffer, { filename: originalName, contentType: mimetype });
+  form.append("file", buffer, { filename: originalName, contentType: vaultMimeOf(mimetype) });
 
   const response = await axios.post(`${baseURL}/files/upload-api`, form, {
     headers: {

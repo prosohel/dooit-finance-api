@@ -63,6 +63,7 @@ const AlertSchema = new Schema(
     ruleId: { type: String, trim: true, index: true, default: null },
     ruleName: { type: String, trim: true, default: null },
     ruleVersion: { type: Number, default: null },  // Number, matches RuleEngine.version
+    ruleMeta: { type: Schema.Types.Mixed, default: {} },
 
     // Serialized rule metadata at fire time — used to explain WHY the
     // rule fired (matched conditions, logic tree snapshot, etc.)

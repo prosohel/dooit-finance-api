@@ -1,7 +1,7 @@
 const express = require("express");
 const { protect } = require("../middleware/auth");
 const multer = require("multer");
-const { status, handoff, handoffInbound, handoffExchange, fileForAfcOs, fileStoreForAfcOs } = require("../controllers/afcOsController");
+const { status, handoff, handoffInbound, handoffExchange, fileForAfcOs, fileStoreForAfcOs, fileDeleteForAfcOs } = require("../controllers/afcOsController");
 // Memory storage: the bytes go straight to the vault service; 25 MB per document (docs/78 §8).
 const uploadForAfcOs = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 const { exchangeCaller } = require("../middleware/exchangeAuth");
@@ -79,5 +79,13 @@ router.get("/files/:id", exchangeCaller, fileForAfcOs);
  *     tags: [AFC OS]
  */
 router.post("/files", exchangeCaller, uploadForAfcOs.single("file"), fileStoreForAfcOs);
+/**
+ * @swagger
+ * /afc-os/files/{id}:
+ *   delete:
+ *     summary: Remove a file-vault object once AFC OS has purged the document after retention — signed service call
+ *     tags: [AFC OS]
+ */
+router.delete("/files/:id", exchangeCaller, fileDeleteForAfcOs);
 
 module.exports = router;

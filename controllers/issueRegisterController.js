@@ -2,6 +2,7 @@ const asyncHandler    = require("../middleware/async");
 const ErrorResponse   = require("../utils/errorResponse");
 const IssueRegister   = require("../models/IssueRegister");
 const RemediationTask = require("../models/RemediationTask");
+const { notifyGapRemediation } = require("../services/exchangeEmit");
 
 const POPULATE_ISSUE = [
   { path: "owner",          select: "name email" },
@@ -107,10 +108,13 @@ exports.updateIssue = asyncHandler(async (req, res, next) => {
     updates.closedBy = req.user?._id;
   }
 
+  const before = updates.status ? await IssueRegister.findById(req.params.id).select("status").lean() : null;
   const doc = await IssueRegister.findByIdAndUpdate(req.params.id, updates, {
     new: true, runValidators: true,
   }).populate(POPULATE_ISSUE);
   if (!doc) return next(new ErrorResponse("Issue not found", 404));
+  // An issue raised from an AFC OS gap: the regulator sees its status change (closed, accepted risk, reopened).
+  if (updates.status && before && before.status !== doc.status) await notifyGapRemediation({ issue: doc, status: doc.status, by: req.user?.name ?? null, note: updates.notes ?? null });
   res.json({ success: true, data: doc });
 });
 
@@ -122,6 +126,7 @@ exports.deleteIssue = asyncHandler(async (req, res, next) => {
     { new: true }
   );
   if (!doc) return next(new ErrorResponse("Issue not found", 404));
+  await notifyGapRemediation({ issue: doc, status: "Closed", by: req.user?.name ?? null });
   res.json({ success: true, data: doc._id });
 });
 
@@ -159,10 +164,16 @@ exports.updateTask = asyncHandler(async (req, res, next) => {
     updates.completedAt = new Date();
     updates.completedBy = req.user?._id;
   }
+  const before = updates.status ? await RemediationTask.findById(req.params.taskId).select("status").lean() : null;
   const task = await RemediationTask.findByIdAndUpdate(req.params.taskId, updates, {
     new: true, runValidators: true,
   }).populate("assignedTo", "name email");
   if (!task) return next(new ErrorResponse("Task not found", 404));
+  // Completed / reopened / in progress on a task that came from an AFC OS gap → the officer's gap card updates.
+  if (updates.status && before && before.status !== task.status) {
+    const issue = await IssueRegister.findById(task.issue).select("issueId client tags closedAt").lean();
+    if (issue) await notifyGapRemediation({ issue, task, status: task.status, by: req.user?.name ?? null, note: updates.notes ?? null });
+  }
   res.json({ success: true, data: task });
 });
 
