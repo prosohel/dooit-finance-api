@@ -19,7 +19,8 @@ const { Schema } = mongoose;
  *                        e.g. [{ user: <id>, modules: ["PRIVACY"], options: ["USER.ADD"] }]
  *
  * Access check (isGranted):
- *   1. Role has PRIVACY.ENCRYPTVIEW in permissions
+ *   1. Role has PRIVACY.ENCRYPTVIEW in the narrowest grant that applies:
+ *      own scope → client-wide (branch users) → global
  *   2. User is NOT restricted from "PRIVACY" module OR "PRIVACY.ENCRYPTVIEW" option
  *
  * Permission filtering (getPermissions):
@@ -140,17 +141,36 @@ RolePermissionSchema.statics.isGranted = async function (userId, roleId, { clien
 
   const now = new Date();
 
-  const query = {
+  // Every active grant of the role (at most one per scope — unique index).
+  const grants = await this.find({
     isActive: true,
     role: roleId,
-    permissions: "PRIVACY.ENCRYPTVIEW",
     $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-  };
+  })
+    .select("client branch permissions restrictedUsers")
+    .lean();
 
-  if (clientId) query.client = clientId;
-  if (branchId) query.branch = branchId;
+  const same = (a, b) => String(a ?? "") === String(b ?? "");
 
-  const doc = await this.findOne(query).select("restrictedUsers").lean();
+  // Narrowest scope that holds a grant for the role decides; a narrower grant
+  // without ENCRYPTVIEW is a deliberate "no" a broader one does not override:
+  //   1. the user's own scope (client and/or branch)
+  //   2. client-wide (branch null) — for branch users
+  //   3. global (client and branch null) — the grant the Permissions screen
+  //      edits and getPermissions() already honours. Without this tier a
+  //      tenant admin holding PRIVACY.ENCRYPT/DECRYPT via the global grant
+  //      could rewrite PII but only ever read "***".
+  // With no client/branch, tier 1 is every grant of the role (as before).
+  const tiers = [
+    grants.filter(
+      (g) => (!clientId || same(g.client, clientId)) && (!branchId || same(g.branch, branchId)),
+    ),
+    clientId && branchId ? grants.filter((g) => same(g.client, clientId) && g.branch == null) : [],
+    grants.filter((g) => g.client == null && g.branch == null),
+  ];
+  const doc = tiers
+    .find((tier) => tier.length)
+    ?.find((g) => (g.permissions || []).includes("PRIVACY.ENCRYPTVIEW"));
   if (!doc) return false;
 
   const entry = doc.restrictedUsers.find(

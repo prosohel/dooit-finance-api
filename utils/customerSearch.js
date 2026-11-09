@@ -85,4 +85,51 @@ async function searchCustomers({ q = '', limit = 50, clientId = null, branchId =
   return data;
 }
 
-module.exports = { searchCustomers };
+const KYC_SEARCH_PATHS = [
+  'personalKyc.personal_form.customer_details.given_name',
+  'personalKyc.personal_form.customer_details.middle_name',
+  'personalKyc.personal_form.customer_details.surname',
+  'personalKyc.personal_form.contact_details.email',
+].join(' ');
+
+/**
+ * _ids of the customers matching `filter` whose KYC full name and/or email
+ * contains `text` (case-insensitive), compared on decrypted values.
+ *
+ * For the queue list + Excel export: they regex the KYC columns in Mongo, which
+ * only ever matches plaintext rows. The caller ORs these ids into that regex
+ * group. The caller must gate this on the viewer's decrypt permission
+ * (canReadDecrypted) — a viewer who sees "***" must not be able to find a
+ * customer by a name they cannot read.
+ *
+ * @param {object}  filter              Mongoose filter (tenant scope + other filters)
+ * @param {string}  text                search text
+ * @param {object}  [opts]
+ * @param {boolean} [opts.name=true]    match the full name
+ * @param {boolean} [opts.email=true]   match the KYC email
+ * @returns {Promise<ObjectId[]>}
+ */
+async function findIdsByDecryptedKyc(filter, text, { name = true, email = true } = {}) {
+  const needle = String(text || '').trim().toLowerCase();
+  if (!needle) return [];
+
+  // Mongoose (not the raw collection) so string ids in `filter` are cast.
+  // dec() handles both shapes: ciphertext, or values the read hook has
+  // already decrypted.
+  const docs = await Customer.find(filter).select(KYC_SEARCH_PATHS).lean();
+
+  const ids = [];
+  for (const c of docs) {
+    const det = c.personalKyc?.personal_form?.customer_details || {};
+    const contact = c.personalKyc?.personal_form?.contact_details || {};
+    const hay = [];
+    if (name) {
+      hay.push([dec(det.given_name), dec(det.middle_name), dec(det.surname)].filter(Boolean).join(' '));
+    }
+    if (email) hay.push(dec(contact.email));
+    if (hay.some((h) => h.toLowerCase().includes(needle))) ids.push(c._id);
+  }
+  return ids;
+}
+
+module.exports = { searchCustomers, findIdsByDecryptedKyc };
