@@ -129,10 +129,15 @@ exports.protect = asyncHandler(async (req, res, next) => {
       // The membership's tenant no longer exists — fail closed instead of
       // falling back to unscoped access.
       if ((clientId && !tokenClient) || (branchId && !tokenBranch)) {
-        return next(new ErrorResponse("Not authorize to access this route", 401));
+        return next(new ErrorResponse("The organisation for this login no longer exists", 401));
       }
       client = tokenClient;
       branch = tokenBranch;
+      // A staff login must act for a tenant. With neither a membership tenant
+      // nor an owned Client/Branch, every tenant filter would run unscoped.
+      if (!client && !branch) {
+        return next(new ErrorResponse("This login is not linked to an organisation", 401));
+      }
     }
 
     const resolvedClientId = client?._id ?? clientId ?? null;
