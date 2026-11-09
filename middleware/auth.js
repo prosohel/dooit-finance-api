@@ -178,7 +178,7 @@ exports.protect = asyncHandler(async (req, res, next) => {
 
       [canReadDecrypted, permissions] = await Promise.all([
         RolePermission.isGranted(u._id, roleId, { clientId: resolvedClientId, branchId: resolvedBranchId }),
-        RolePermission.getPermissions(roleId, u._id),
+        RolePermission.getPermissions(roleId, u._id, { clientId: resolvedClientId, branchId: resolvedBranchId }),
       ]);
     } catch (permErr) {
       console.error("[auth] RolePermission lookup failed:", permErr.message);
