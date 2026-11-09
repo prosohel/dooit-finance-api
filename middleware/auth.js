@@ -105,8 +105,38 @@ exports.protect = asyncHandler(async (req, res, next) => {
     //   branchId ? Branch.findById(branchId).populate("client").lean() : Promise.resolve(null),
     // ]);
 
-    const resolvedClientId = u.client?._id ?? clientId?? null;
-    const resolvedBranchId = u.branch?._id ?? branchId ?? null;
+    // Tenant for staff logins (userType client/branch). `u.client`/`u.branch`
+    // are populate virtuals keyed on OWNERSHIP (Client.user / Branch.user), so
+    // they were null for every staff member who doesn't own the record —
+    // compliance officers, managers, non-owner admins — and every
+    // `req.user.client._id` tenant filter downstream silently ran unscoped
+    // (customer list, exports, privacy bulk encrypt/decrypt, record creation).
+    // The token's clientBelongs/branchBelongs come from the membership chosen
+    // at login / switch-context, so they decide the tenant. Owners whose token
+    // names the client they own need no extra query. Platform (dooit) and
+    // customer logins are unchanged.
+    let client = u.client ?? null;
+    let branch = u.branch ?? null;
+    if (u.userType === "client" || u.userType === "branch") {
+      const [tokenClient, tokenBranch] = await Promise.all([
+        clientId && String(client?._id) !== String(clientId)
+          ? Client.findById(clientId).lean()
+          : client,
+        branchId && String(branch?._id) !== String(branchId)
+          ? Branch.findById(branchId).lean()
+          : branch,
+      ]);
+      // The membership's tenant no longer exists — fail closed instead of
+      // falling back to unscoped access.
+      if ((clientId && !tokenClient) || (branchId && !tokenBranch)) {
+        return next(new ErrorResponse("Not authorize to access this route", 401));
+      }
+      client = tokenClient;
+      branch = tokenBranch;
+    }
+
+    const resolvedClientId = client?._id ?? clientId ?? null;
+    const resolvedBranchId = branch?._id ?? branchId ?? null;
 
     let qr = null;
     if (resolvedClientId && (u.userType === 'client' || u.userType === 'branch')) {
@@ -123,13 +153,12 @@ exports.protect = asyncHandler(async (req, res, next) => {
 
       clientBelongs: resolvedClientId,
       branchBelongs: resolvedBranchId,
-      client: u?.client ?? u?.branch?.client ?? null,
-      // `u.branch` is populated one level deep, so `branch.client` is already the
-      // id (not a document) — collapse both shapes to an id. Referencing a bare
-      // `branch` here threw a ReferenceError for every branch user, which the
-      // catch below reported as a 401.
-      branch: u?.branch
-        ? { ...u.branch, client: u.branch.client?._id ?? u.branch.client ?? null }
+      client: client ?? branch?.client ?? null,
+      // `branch` is populated one level deep (or loaded lean), so
+      // `branch.client` is already the id (not a document) — collapse both
+      // shapes to an id.
+      branch: branch
+        ? { ...branch, client: branch.client?._id ?? branch.client ?? null }
         : null,
       qr,
     };
