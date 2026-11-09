@@ -7,6 +7,8 @@ const { Schema } = mongoose;
 const {
   RISK_LABELS, CASE_TYPES, PRIORITIES, normalizeCaseType, slaFields, addOverdueVirtual,
 } = require('./schemas/riskShared');
+// Registers the model the monitoringResult virtual populates from.
+require('./TransactionMonitoringAiResult');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-schemas
@@ -187,6 +189,18 @@ AlertSchema.index({ 'riskScore': -1 });
 // ─────────────────────────────────────────────────────────────────────────────
 
 addOverdueVirtual(AlertSchema, ['dismissed', 'false_positive', 'escalated_to_case']);
+
+// AI transaction-monitoring result behind the alert, from the collection the
+// AFC monitoring service writes. Keyed on transaction → transactionId (that
+// collection's unique index) plus _id → alert.alertId, so a result that belongs
+// to another alert never attaches. Absent unless populated (GET /alert/:id,
+// GET /alert/:id/monitoring-result); null when populated and there is none.
+AlertSchema.virtual('monitoringResult', {
+  ref: 'TransactionMonitoringAiResult',
+  localField: ['transaction', '_id'],
+  foreignField: ['transactionId', 'alert.alertId'],
+  justOne: true,
+});
 
 
 

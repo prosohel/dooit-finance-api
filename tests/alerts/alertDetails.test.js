@@ -4,6 +4,7 @@
  *   POST /alert/:id/notes                — analyst note → alert.activity (type 'note')
  *   GET  /alert/:id/audit                — alert-scoped AuditLog rows
  *   GET  /alert/:id/related-transactions — other transactions of the alert's customer
+ *   GET  /alert/:id/monitoring-result    — AI transaction-monitoring result behind the alert
  *
  * Self-contained model pattern: in-memory Mongo, handlers invoked directly
  * with a stub req/res/next (asyncHandler just awaits the promise).
@@ -17,7 +18,7 @@ const mongoose = require("mongoose");
 const { MongoMemoryServer } = require("mongodb-memory-server");
 
 let mongod;
-let Alert, Transaction, Customer, RuleEngine, AuditLog, ctrl;
+let Alert, Transaction, Customer, RuleEngine, AuditLog, AiResult, ctrl;
 
 // asyncHandler does not hand back the handler's promise, so settle on whichever
 // of res.json / next fires first (with a guard so a hung handler fails fast).
@@ -49,6 +50,7 @@ beforeAll(async () => {
   RuleEngine = require("../../models/RuleEngine");
   AuditLog = require("../../models/AuditLog");
   Alert = require("../../models/Alert");
+  AiResult = require("../../models/TransactionMonitoringAiResult");
   ctrl = require("../../controllers/alertController");
   await Promise.all(Object.values(mongoose.models).map((m) => m.init()));
 });
@@ -63,7 +65,7 @@ const user = { _id: new mongoose.Types.ObjectId(), name: "Ayesha Rahman", role: 
 let customer, txn, other, older, rule, alert;
 
 beforeEach(async () => {
-  await Promise.all([Alert.deleteMany({}), Transaction.deleteMany({}), Customer.deleteMany({}), RuleEngine.deleteMany({}), AuditLog.deleteMany({})]);
+  await Promise.all([Alert.deleteMany({}), Transaction.deleteMany({}), Customer.deleteMany({}), RuleEngine.deleteMany({}), AuditLog.deleteMany({}), AiResult.deleteMany({})]);
   customer = await Customer.create({ isPep: true, country: "AU", relations: [{ client: new mongoose.Types.ObjectId(), type: "individual", registeredAt: new Date("2026-06-24") }] });
   txn = await Transaction.create({ amount: 139983, currency: "AUD", type: "withdrawal", sender: { customer: customer._id, name: "S" }, timestamp: new Date() });
   other = await Transaction.create({ amount: 9850, currency: "AUD", type: "withdrawal", sender: { customer: customer._id, name: "S" }, timestamp: new Date(Date.now() - 2 * 86400e3) });
@@ -167,5 +169,44 @@ describe("GET /alert/:id/related-transactions", () => {
     const orphan = await Alert.create({ riskLabel: "Low" });
     const { res } = await call(ctrl.getRelatedTransactions, { params: { id: String(orphan._id) }, query: {} });
     expect(res.body.data).toEqual([]);
+  });
+});
+
+describe("GET /alert/:id/monitoring-result", () => {
+  const resultFor = (a, extra = {}) => AiResult.create({
+    transactionId: a.transaction, alert: { alertId: a._id, uid: a.uid, status: "new", action: "created" },
+    overall: { isRisky: true, riskScore: 75, riskLabel: "High", detectedBy: ["rule"], agreement: "1/3" },
+    ruleHits: [{ ruleId: "R223", matchedConditions: [{ field: "x", operator: "between", expected: { min: 1, max: 2 }, actual: 1.5 }] }],
+    ...extra,
+  });
+
+  test("returns the result linked to the alert", async () => {
+    const r = await resultFor(alert);
+    const { res, err } = await call(ctrl.getAlertMonitoringResult, { params: { id: String(alert._id) } });
+    expect(err).toBeNull();
+    expect(String(res.body.data._id)).toBe(String(r._id));
+    expect(res.body.data.ruleHits[0].matchedConditions[0].expected).toEqual({ min: 1, max: 2 });
+  });
+
+  test("GET /alert/:id embeds it as monitoringResult (null when there is none)", async () => {
+    const before = JSON.parse(JSON.stringify((await call(ctrl.getAlert, { params: { id: String(alert._id) } })).res.body.data));
+    expect(before.monitoringResult).toBeNull();
+    const r = await resultFor(alert);
+    const after = JSON.parse(JSON.stringify((await call(ctrl.getAlert, { params: { id: String(alert._id) } })).res.body.data));
+    expect(after.monitoringResult._id).toBe(String(r._id));
+    expect(after.monitoringResult.overall.riskLabel).toBe("High");
+  });
+
+  test("ignores a result for the same transaction that belongs to another alert", async () => {
+    await resultFor({ ...alert.toObject(), _id: new mongoose.Types.ObjectId() });
+    const { res } = await call(ctrl.getAlertMonitoringResult, { params: { id: String(alert._id) } });
+    expect(res.body).toEqual({ succeed: true, data: null });
+  });
+
+  test("data: null for an alert with no AI result, 404 for an unknown alert", async () => {
+    const { res } = await call(ctrl.getAlertMonitoringResult, { params: { id: String(alert._id) } });
+    expect(res.body).toEqual({ succeed: true, data: null });
+    const { err } = await call(ctrl.getAlertMonitoringResult, { params: { id: String(new mongoose.Types.ObjectId()) } });
+    expect(err.statusCode).toBe(404);
   });
 });

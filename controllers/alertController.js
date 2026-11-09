@@ -203,7 +203,8 @@ exports.getAlert = asyncHandler(async (req, res, next) => {
     .populate({ path: "linkedCase", select: "uid title status priority caseType assignedTo slaDeadline", populate: { path: "assignedTo", select: "name" } })
     .populate("notify", "uid status notes createdAt")
     .populate("activity.createdBy", "name")
-    .populate("auditLogs.performedBy", "name");
+    .populate("auditLogs.performedBy", "name")
+    .populate("monitoringResult");
 
   if (!alert) {
     return next(new ErrorResponse(`Alert not found with id ${req.params.id}`, 404));
@@ -483,6 +484,25 @@ exports.getAlertReports = asyncHandler(async (req, res, next) => {
     data: { ecdd, smr, ttr, ifti, gfs, rfi, dismissal },
     summary: { counts, total, sarFiled, linkedCase: caseId },
   });
+});
+
+// @desc   The AI transaction-monitoring result behind this alert, or data: null
+//         for alerts the AFC monitoring service didn't raise (rule/manual).
+// @route  GET /api/v1/alert/:id/monitoring-result
+// @access Private (ALERT.GET)
+exports.getAlertMonitoringResult = asyncHandler(async (req, res, next) => {
+  /*
+    #swagger.tags = ['Alert']
+    #swagger.summary = 'AI transaction-monitoring result for an alert'
+  */
+  // Same join getAlert embeds: the Alert.monitoringResult virtual.
+  const alert = await Alert.findOne({ _id: req.params.id, isDeleted: { $ne: true } })
+    .select("transaction")
+    .populate("monitoringResult")
+    .lean();
+  if (!alert) return next(new ErrorResponse(`Alert not found with id ${req.params.id}`, 404));
+
+  res.status(200).json({ succeed: true, data: alert.monitoringResult ?? null });
 });
 
 // @desc   ECCD Dummy Data for Presentation
