@@ -12,7 +12,7 @@ const TestTemplateSchema = new mongoose.Schema(
     controlRef:  { type: mongoose.Schema.Types.ObjectId, ref: "Control", default: null },
     domain: {
       type: String,
-      enum: ["GOV","CDD","SCR","TM","RPT","RA","TECH","FRD","CYB","PRV","TRN","RK","OUT","COM","FC","FR","CM"],
+      enum: ["GOV","CDD","SCR","TM","RPT","RA","TECH","FRD","CYB","PRV","TRN","RK","OUT","COM","FC","FR","CM","SUP","INT"],
     },
 
     testType: {

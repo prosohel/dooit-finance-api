@@ -11,7 +11,34 @@ const ObligationLibrarySchema = new mongoose.Schema(
       uppercase: true,
       index: true,
     },
-    // e.g. "GOV-001" | "AML-010" | "CDD-001" | "CON-001"
+    // e.g. "GOV-001" | "AML-010" | "CDD-001" | "CON-001" | "BD-AML-001" (jurisdiction packs are prefixed)
+
+    // ── Jurisdiction pack fields (seed/<jurisdiction>/pack.json) ──
+    jurisdiction: { type: String, trim: true, uppercase: true, default: "AU", index: true },
+    // ISO-3166 alpha-2: "AU" (AUSTRAC/ASIC content) | "BD" (Bangladesh MLPA 2012)
+
+    displayId: { type: String, trim: true },
+    // Blueprint ID shown in the UI when obligationId carries a jurisdiction prefix, e.g. "AML-001" for "BD-AML-001"
+
+    addressee: {
+      type: String,
+      enum: ["RO", "ControllingAuthority", "BFIU", "Government", "InvestigatingAgency", "Court", "AnyPerson", ""],
+      default: "",
+    },
+    // Who the provision binds. Drives owns / supervises / reference relations per entity.
+
+    kind: {
+      type: String,
+      enum: ["duty", "power", "penalty", "structural", ""],
+      default: "",
+    },
+    // "may" provisions are powers; ENF-* are penalty references; neither is a control-testable duty.
+
+    amended2015: { type: Boolean, default: false },
+    // Bangladesh: provision introduced or changed by Act No. 25 of 2015
+
+    packVersion: { type: String, trim: true },
+    // Version of the jurisdiction pack that last wrote this record
 
     regulatorySource: { type: String, trim: true },
     // e.g. "RG104 s912A(1)(a); Corporations Act"

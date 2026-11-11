@@ -40,6 +40,7 @@ const SEEDERS = [
   ["seedEntityTypes",        "Entity / License / Designated-Service types (foundational)"],
   ["seedControls",           "Controls library (~181 controls)"],
   ["seedObligations",        "Obligation library (~145, references control IDs)"],
+  ["seedBangladeshPack",     "Bangladesh MLPA 2012 pack: 44 obligations + 14 controls + map (seed/bangladesh)"],
   ["seedCountryRisk",        "Country risk register (~201 jurisdictions, CRA)"],
   ["seedRiskFactors",        "CRA V2 RiskFactorOptions (+ product scores)"],
   ["seedEntityConfig",       "EWRA EntityConfig (risk pool config)"],

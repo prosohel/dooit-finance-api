@@ -12,7 +12,7 @@ const ControlAssignmentSchema = new mongoose.Schema(
     controlId: { type: String, required: true, uppercase: true, trim: true, index: true },
     domain: {
       type: String, required: true,
-      enum: ["GOV", "CDD", "SCR", "TM", "RPT", "RA", "TECH", "FRD", "CYB", "PRV", "TRN", "RK", "OUT", "COM", "FC", "FR", "CM"]
+      enum: ["GOV", "CDD", "SCR", "TM", "RPT", "RA", "TECH", "FRD", "CYB", "PRV", "TRN", "RK", "OUT", "COM", "FC", "FR", "CM", "SUP", "INT"]
     },
     entityType: {
       type: String, required: true,

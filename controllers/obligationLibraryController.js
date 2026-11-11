@@ -6,11 +6,16 @@ const ErrorResponse = require("../utils/errorResponse");
 // @route  GET /api/v1/obligation-library
 // @access Protected
 exports.getObligations = asyncHandler(async (req, res) => {
-  const { category, entityType, license, service, search, page = 1, limit = 50 } = req.query;
+  const { category, entityType, license, service, search, jurisdiction, page = 1, limit = 50 } = req.query;
 
   const filter = { active: true };
 
   if (category) filter.category = category;
+  // Pre-pack records have no jurisdiction field: treat them as AU.
+  if (jurisdiction) {
+    const j = String(jurisdiction).toUpperCase();
+    filter.jurisdiction = j === "AU" ? { $in: ["AU", null] } : j;
+  }
 
   if (entityType) {
     filter.$or = [
@@ -130,6 +135,11 @@ exports.bulkImport = asyncHandler(async (req, res) => {
 // @route  GET /api/v1/obligation-library/categories
 // @access Protected
 exports.getCategories = asyncHandler(async (req, res) => {
-  const categories = await ObligationLibrary.distinct("category", { active: true });
+  const catFilter = { active: true };
+  if (req.query.jurisdiction) {
+    const j = String(req.query.jurisdiction).toUpperCase();
+    catFilter.jurisdiction = j === "AU" ? { $in: ["AU", null] } : j;
+  }
+  const categories = await ObligationLibrary.distinct("category", catFilter);
   res.status(200).json({ success: true, data: categories.sort() });
 });

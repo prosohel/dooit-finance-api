@@ -9,12 +9,17 @@ const getClient = (req) => req.user?.client?._id || req.user?.clientBelongs || n
 // @access Protected
 exports.getControls = asyncHandler(async (req, res) => {
   const {
-    domain, controlType, automationLevel, riskMitigationLevel, owner,
+    domain, controlType, automationLevel, riskMitigationLevel, owner, jurisdiction,
     active = "true", search, page = 1, limit = 50,
   } = req.query;
 
   const filter = {};
   if (domain) filter.domain = domain;
+  // Pre-pack records have no jurisdiction field: treat them as AU.
+  if (jurisdiction) {
+    const j = String(jurisdiction).toUpperCase();
+    filter.jurisdiction = j === "AU" ? { $in: ["AU", null] } : j;
+  }
   if (controlType) filter.controlType = controlType;
   if (automationLevel) filter.automationLevel = automationLevel;
   if (riskMitigationLevel) filter.riskMitigationLevel = riskMitigationLevel;

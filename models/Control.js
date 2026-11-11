@@ -14,10 +14,16 @@ const ControlSchema = new mongoose.Schema(
     domain: {
       type: String,
       required: true,
-      enum: ["GOV","CDD","SCR","TM","RPT","RA","TECH","FRD","CYB","PRV","TRN","RK","OUT","COM","FC","FR","CM"],
+      enum: ["GOV","CDD","SCR","TM","RPT","RA","TECH","FRD","CYB","PRV","TRN","RK","OUT","COM","FC","FR","CM","SUP","INT"],
+      // SUP = Supervision & Enforcement, INT = International Cooperation (regulator-side packs)
       index: true,
     },
-    prefix: { type: String, trim: true }, // e.g. "CTRL_GOV"
+    prefix: { type: String, trim: true }, // e.g. "CTRL_GOV" | "BD-CTRL"
+
+    // ── Jurisdiction pack fields (seed/<jurisdiction>/pack.json) ──
+    jurisdiction: { type: String, trim: true, uppercase: true, default: "AU", index: true },
+    displayId: { type: String, trim: true }, // e.g. "CTRL-001" for "BD-CTRL-001"
+    packVersion: { type: String, trim: true },
     title: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
     controlType: {
@@ -33,7 +39,8 @@ const ControlSchema = new mongoose.Schema(
     testingProcedure: { type: String, trim: true },
     testingFrequency: {
       type: String,
-      enum: ["Daily", "Weekly", "Monthly", "Quarterly", "Annually"],
+      enum: ["Daily", "Weekly", "Monthly", "Quarterly", "Annually", "Event-driven"],
+      // Event-driven = per inspection / per order / per breach / per RFI
       default: "Annually",
     },
     fatfRecommendations: [{ type: String }], // e.g. ["Rec 1", "Rec 2"]
