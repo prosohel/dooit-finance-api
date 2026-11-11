@@ -38,6 +38,8 @@ const TTR = require("../models/TtrReport");
 const IFTI = require("../models/IftiReport");
 const GFS = require("../models/gfsReport");
 const RFI = require("../models/Rfi");
+const { canReadDecrypted } = require("../utils/roleEncryptionPlugin");
+const { findIdsByDecryptedKyc } = require("../utils/customerSearch");
 const { buildRiskAssessmentFromCustomer } = require("../utils/riskAssessment");
 const { getCentroid } = require("../utils/countryCentroids");
 const { customerRelatedToTenant } = require("../utils/customerTenantGuard");
@@ -4549,15 +4551,21 @@ exports.exportCustomers = asyncHandler(async (req, res, next) => {
 
   // OR-groups combined via $and so search + email don't clobber each other.
   const andGroups = [];
+  // Same decrypted-value matching as the queue list (see
+  // advancedCustomerResultsQueryOnly) — only for viewers who may read PII.
+  const decryptedSearch = canReadDecrypted();
   if (!isEmptyExport(req.query.q)) {
     const rx = new RegExp(String(req.query.q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-    andGroups.push({
-      $or: [
-        { "personalKyc.personal_form.customer_details.given_name": rx },
-        { "personalKyc.personal_form.customer_details.surname": rx },
-        { uid: rx },
-      ],
-    });
+    const orGroup = [
+      { "personalKyc.personal_form.customer_details.given_name": rx },
+      { "personalKyc.personal_form.customer_details.surname": rx },
+      { uid: rx },
+    ];
+    if (decryptedSearch) {
+      const ids = await findIdsByDecryptedKyc(dbQuery, req.query.q, { email: false });
+      if (ids.length) orGroup.push({ _id: { $in: ids } });
+    }
+    andGroups.push({ $or: orGroup });
   }
   if (!isEmptyExport(req.query.email)) {
     // Raw email feeds hashForSearch below — only the regex is escaped
@@ -4567,6 +4575,10 @@ exports.exportCustomers = asyncHandler(async (req, res, next) => {
       { "personalKyc.personal_form.contact_details.email": rx },
       { "metadata.email": rx },
     ];
+    if (decryptedSearch) {
+      const ids = await findIdsByDecryptedKyc(dbQuery, email, { name: false });
+      if (ids.length) orGroup.push({ _id: { $in: ids } });
+    }
     // Exact email → match the linked (encrypted) Users record via emailHash.
     try {
       const matched = await User.find({ emailHash: hashForSearch(email) })

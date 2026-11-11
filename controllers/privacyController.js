@@ -120,18 +120,21 @@ async function buildCustomerFilter(encrypt, clientId, branchId) {
 
 /**
  * Build a User filter scoped to users who have a linked Customer document.
- * Only users where Customer.user === user._id are targeted in bulk operations.
+ * Only users where Customer.user === user._id are targeted in bulk operations,
+ * and only through customers in the caller's tenant scope (the same scope
+ * buildCustomerFilter uses) — one tenant's bulk run must not rewrite another
+ * tenant's portal users. getMe's encryptionStatus counts this same set.
  *
  * @param {boolean} encrypt
  * @param {*}       clientId
  * @param {*}       branchId
  * @returns {Promise<object>} MongoDB filter for User collection
  */
-async function buildUserFilter(encrypt) {
+async function buildUserFilter(encrypt, clientId = null, branchId = null) {
   const base = encrypt ? { isDataEncrypted: { $ne: true } } : {};
 
-  // Only target users referenced by a Customer document
-  const linkedUserIds = await Customer.distinct('user', { user: { $ne: null } });
+  const customerScope = await buildCustomerFilter(false, clientId, branchId);
+  const linkedUserIds = await Customer.distinct('user', { ...customerScope, user: { $ne: null } });
   base['_id'] = { '$in': linkedUserIds };
 
   return base;
@@ -376,7 +379,7 @@ exports.bulkUpdateUserEncryption = asyncHandler(async (req, res, next) => {
 
   // Pre-check: skip if all users in scope are already encrypted
   if (encrypted) {
-    const scopeFilter = await buildUserFilter(false);
+    const scopeFilter = await buildUserFilter(false, clientId, branchId);
     const [total, alreadyEncrypted] = await Promise.all([
       User.countDocuments(scopeFilter),
       User.countDocuments({ ...scopeFilter, isDataEncrypted: true }),
@@ -392,7 +395,7 @@ exports.bulkUpdateUserEncryption = asyncHandler(async (req, res, next) => {
     }
   }
 
-  const filter = await buildUserFilter(encrypted);
+  const filter = await buildUserFilter(encrypted, clientId, branchId);
   const users = await User.find(filter).select("_id isDataEncrypted");
 
   let processed = 0;
@@ -596,7 +599,7 @@ exports.bulkUpdateAllEncryption = asyncHandler(async (req, res, next) => {
 
   // Pre-check: skip if all users AND all customers in scope are already encrypted
   if (encrypted) {
-    const userScope = await buildUserFilter(false);
+    const userScope = await buildUserFilter(false, clientId, branchId);
     const customerScope = await buildCustomerFilter(false, clientId, branchId);
     const [totalUsers, encUsers, totalCustomers, encCustomers] = await Promise.all([
       User.countDocuments(userScope),
@@ -620,7 +623,7 @@ exports.bulkUpdateAllEncryption = asyncHandler(async (req, res, next) => {
   }
 
   const [users, customers] = await Promise.all([
-    User.find(await buildUserFilter(encrypted)).select("_id isDataEncrypted"),
+    User.find(await buildUserFilter(encrypted, clientId, branchId)).select("_id isDataEncrypted"),
     Customer.find(await buildCustomerFilter(encrypted, clientId, branchId)).select("_id isDataEncrypted"),
   ]);
 

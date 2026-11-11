@@ -18,6 +18,7 @@ const {
   getAlertAudit,
   getRelatedTransactions,
   getAlertReports,
+  getAlertMonitoringResult,
   getAttachableCases,
 } = require("../controllers/alertController");
 
@@ -76,6 +77,8 @@ router.route("/:id/audit").get(authorizePermission("ALERT.GET"), getAlertAudit);
 router.route("/:id/related-transactions").get(authorizePermission("ALERT.GET"), getRelatedTransactions);
 // Compliance reports raised from this alert (works before and after escalation).
 router.route("/:id/reports").get(authorizePermission("ALERT.GET"), getAlertReports);
+// AI transaction-monitoring result (transaction-monitoring-ai-results) behind the alert.
+router.route("/:id/monitoring-result").get(authorizePermission("ALERT.GET"), getAlertMonitoringResult);
 
 // ── AML alert lifecycle ───────────────────────────────────────────────────────
 // Analyst picks up an alert for review

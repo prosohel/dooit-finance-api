@@ -18,12 +18,16 @@ const { Schema } = mongoose;
  *                        Both can be combined.
  *                        e.g. [{ user: <id>, modules: ["PRIVACY"], options: ["USER.ADD"] }]
  *
+ * Which grant applies (resolveGrant): the narrowest scope that holds one —
+ *   own branch → own client (client-wide) → global (client and branch null).
+ *
  * Access check (isGranted):
- *   1. Role has PRIVACY.ENCRYPTVIEW in permissions
+ *   1. Role has PRIVACY.ENCRYPTVIEW in the grant that applies
  *   2. User is NOT restricted from "PRIVACY" module OR "PRIVACY.ENCRYPTVIEW" option
  *
  * Permission filtering (getPermissions):
- *   Returns the role's permissions minus any modules/options the user is restricted from.
+ *   Returns the applying grant's permissions minus any modules/options the
+ *   user is restricted from.
  */
 
 const RestrictedUserSchema = new Schema(
@@ -123,10 +127,62 @@ RolePermissionSchema.index({ "restrictedUsers.user": 1 });
 RolePermissionSchema.index({ isActive: 1 });
 RolePermissionSchema.index({ client: 1, branch: 1, isActive: 1 });
 
+const sameId = (a, b) => String(a ?? "") === String(b ?? "");
+
+/**
+ * Scopes a caller's grant can come from, narrowest first:
+ *   1. their branch (branch callers)
+ *   2. their client, client-wide (branch null)
+ *   3. global (client and branch null)
+ * The narrowest scope holding a grant for the role decides — a narrower grant
+ * is a deliberate customisation (e.g. without PRIVACY.ENCRYPTVIEW) that a
+ * broader one does not override. Tenant admins customise a role by saving a
+ * grant in their own scope (rolePermissionController); other tenants keep the
+ * global grant. Platform callers (no client/branch) use the global grant.
+ */
+const grantScopes = ({ clientId = null, branchId = null } = {}) => {
+  const scopes = [];
+  if (branchId) {
+    scopes.push((g) => sameId(g.branch, branchId) && (!clientId || sameId(g.client, clientId)));
+  }
+  if (clientId) scopes.push((g) => sameId(g.client, clientId) && g.branch == null);
+  scopes.push((g) => g.client == null && g.branch == null);
+  return scopes;
+};
+
+/**
+ * The active, unexpired grant of `roleId` that applies in a tenant scope
+ * (narrowest first — see grantScopes), or null. Replaces findOne({ role }),
+ * which returned an arbitrary grant once a role had more than one.
+ *
+ * @param {ObjectId|string} roleId
+ * @param {object}          [scope]
+ * @param {ObjectId|string} [scope.clientId]
+ * @param {ObjectId|string} [scope.branchId]
+ * @returns {Promise<object|null>} lean grant
+ */
+RolePermissionSchema.statics.resolveGrant = async function (roleId, scope = {}) {
+  if (!roleId) return null;
+
+  const now = new Date();
+  const grants = await this.find({
+    isActive: true,
+    role: roleId,
+    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+  }).lean();
+
+  for (const inScope of grantScopes(scope)) {
+    const grant = grants.find(inScope);
+    if (grant) return grant;
+  }
+  return null;
+};
+
 /**
  * Check whether a given user can read encrypted fields as plaintext.
  *
- * Returns true  → role has PRIVACY.ENCRYPTVIEW AND user is not restricted from PRIVACY module
+ * Returns true  → the grant that applies (resolveGrant) has PRIVACY.ENCRYPTVIEW
+ *                 AND the user is not restricted from the PRIVACY module
  * Returns false → missing PRIVACY.ENCRYPTVIEW, or user is restricted from PRIVACY (or all)
  *
  * @param {ObjectId|string} userId
@@ -136,24 +192,10 @@ RolePermissionSchema.index({ client: 1, branch: 1, isActive: 1 });
  * @param {ObjectId|string} [options.branchId]
  */
 RolePermissionSchema.statics.isGranted = async function (userId, roleId, { clientId, branchId } = {}) {
-  if (!roleId) return false;
+  const doc = await this.resolveGrant(roleId, { clientId, branchId });
+  if (!doc || !(doc.permissions || []).includes("PRIVACY.ENCRYPTVIEW")) return false;
 
-  const now = new Date();
-
-  const query = {
-    isActive: true,
-    role: roleId,
-    permissions: "PRIVACY.ENCRYPTVIEW",
-    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-  };
-
-  if (clientId) query.client = clientId;
-  if (branchId) query.branch = branchId;
-
-  const doc = await this.findOne(query).select("restrictedUsers").lean();
-  if (!doc) return false;
-
-  const entry = doc.restrictedUsers.find(
+  const entry = (doc.restrictedUsers || []).find(
     (r) => r.user.toString() === userId.toString()
   );
 
@@ -171,31 +213,23 @@ RolePermissionSchema.statics.isGranted = async function (userId, roleId, { clien
 };
 
 /**
- * Get effective permission strings for a given user+role combination.
+ * Get effective permission strings for a given user+role combination, from
+ * the grant that applies in the user's tenant scope (resolveGrant).
  * Filters out any permissions belonging to modules the user is restricted from.
  *
  * @param {ObjectId|string} roleId
  * @param {ObjectId|string} [userId]  - if provided, applies per-user module restrictions
+ * @param {object}          [scope]   - { clientId, branchId } of the active membership
  * @returns {string[]}
  */
-RolePermissionSchema.statics.getPermissions = async function (roleId, userId = null) {
-  if (!roleId) return [];
-
-  const now = new Date();
-  const doc = await this.findOne({
-    isActive: true,
-    role: roleId,
-    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-  })
-    .select("permissions restrictedUsers")
-    .lean();
-
+RolePermissionSchema.statics.getPermissions = async function (roleId, userId = null, scope = {}) {
+  const doc = await this.resolveGrant(roleId, scope);
   if (!doc) return [];
 
   let perms = doc.permissions ?? [];
 
   if (userId) {
-    const entry = doc.restrictedUsers.find(
+    const entry = (doc.restrictedUsers || []).find(
       (r) => r.user.toString() === userId.toString()
     );
 

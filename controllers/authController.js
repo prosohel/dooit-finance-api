@@ -306,14 +306,16 @@ exports.getMe = asyncHandler(async (req, res, next) => {
   const clientId = req.user.client?._id ?? null;
   const branchId = req.user.branch?._id ?? null;
 
-  // Build scope conditions
-  const userScope = [];
+  // Build scope conditions. These must match what PUT /privacy/all/bulk
+  // actually rewrites (privacyController buildCustomerFilter/buildUserFilter):
+  // customers in the tenant, and the portal users linked to those customers.
+  // Counting anything else (e.g. branch staff) means the status can never
+  // reach "encrypted" and the lock button keeps offering to encrypt.
   const customerScope = [];
   if (clientId) {
     customerScope.push({ "relations.client": clientId });
   }
   if (branchId) {
-    userScope.push({ branchBelongs: branchId });
     customerScope.push({ "relations.branch": branchId });
   }
 
@@ -322,11 +324,7 @@ exports.getMe = asyncHandler(async (req, res, next) => {
     ...customerFilter,
     user: { $ne: null },
   });
-  if (customerUserIds.length) {
-    userScope.push({ _id: { $in: customerUserIds } });
-  }
-
-  const userFilter = userScope.length ? { $or: userScope } : {};
+  const userFilter = { _id: { $in: customerUserIds } };
 
   let encryptionStatus = false;
   let encryptionData = {};
@@ -339,10 +337,11 @@ exports.getMe = asyncHandler(async (req, res, next) => {
         Customer.countDocuments({ ...customerFilter, isDataEncrypted: true }),
       ]);
 
+    // A tenant with no linked portal users is still "encrypted" once all its
+    // customers are — requiring totalUsers > 0 left the button stuck.
     encryptionStatus =
-      totalUsers > 0 &&
+      totalUsers + totalCustomers > 0 &&
       encryptedUsers === totalUsers &&
-      totalCustomers > 0 &&
       encryptedCustomers === totalCustomers;
 
     encryptionData = { totalUsers, encryptedUsers, totalCustomers, encryptedCustomers };

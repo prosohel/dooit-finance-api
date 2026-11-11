@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const { buildRiskAssessmentFromCustomer } = require("../utils/riskAssessment");
 const { hashForSearch } = require("../utils/encryption");
+const { canReadDecrypted } = require("../utils/roleEncryptionPlugin");
+const { findIdsByDecryptedKyc } = require("../utils/customerSearch");
 
 const isEmpty = (v) =>
     v === undefined || v === null || v === "" || v === "null";
@@ -78,9 +80,21 @@ module.exports =
                 // -----------------------------
                 const andGroups = [];
 
+                // KYC name/email are AES-encrypted at rest once the Privacy
+                // module encrypts them, so the regexes below only match
+                // plaintext rows. Viewers allowed to read decrypted PII also
+                // match on decrypted values; masked viewers can't search by a
+                // name they can't see. Scoped by dbQuery (tenant + filters).
+                const decryptedSearch = canReadDecrypted();
+
                 if (!isEmpty(req.query.q) && searchFields.length) {
                     const regex = new RegExp(String(req.query.q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-                    andGroups.push({ $or: searchFields.map((path) => ({ [path]: regex })) });
+                    const orGroup = searchFields.map((path) => ({ [path]: regex }));
+                    if (decryptedSearch) {
+                        const ids = await findIdsByDecryptedKyc(dbQuery, req.query.q, { email: false });
+                        if (ids.length) orGroup.push({ _id: { $in: ids } });
+                    }
+                    andGroups.push({ $or: orGroup });
                 }
 
                 // Email filter — the account email lives on the encrypted Users
@@ -95,6 +109,10 @@ module.exports =
                         { "personalKyc.personal_form.contact_details.email": regex },
                         { "metadata.email": regex },
                     ];
+                    if (decryptedSearch) {
+                        const ids = await findIdsByDecryptedKyc(dbQuery, email, { name: false });
+                        if (ids.length) orGroup.push({ _id: { $in: ids } });
+                    }
                     try {
                         const User = mongoose.model("Users");
                         const matched = await User.find({ emailHash: hashForSearch(email) })
