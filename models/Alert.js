@@ -106,7 +106,7 @@ const AlertSchema = new Schema(
     // Whether the alert came from the rule engine or an AI model.
     alertOrigin: {
       type: String,
-      enum: ["Rule Based", "AI Based"],
+      enum: ["Rule Based", "AI Based", "ML Based", "DL Based"], // AI Based = legacy AI model, ML Based = machine learning model, DL Based = deep learning model
       default: "Rule Based",
     }, 
 
