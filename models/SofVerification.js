@@ -67,7 +67,11 @@ const SofDocumentSchema = DocumentMetaSchema.clone();
 SofDocumentSchema.set("_id", true);
 SofDocumentSchema.add({
   docType: { type: String, enum: SOF_DOC_TYPES, required: true },
+  // "sof_qr_upload" = customer via the QR/link, "sof_staff_upload" = a
+  // reviewer uploaded it on the customer's behalf from the dashboard.
   type: { type: String, default: "sof_qr_upload" },
+  // Staff member who uploaded it — null for the customer's own QR upload.
+  uploadedBy: { type: Schema.Types.ObjectId, ref: "Users", default: null },
   status: {
     type: String,
     enum: ["verified", "rejected", "needs_review"],

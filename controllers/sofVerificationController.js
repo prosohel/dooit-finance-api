@@ -16,6 +16,7 @@
  * Routes (see routes/sofVerification.js):
  *   GET  /api/v1/sof-verification/customer/:customerId          (admin)  read (auto-create) the session + QR + documents
  *   POST /api/v1/sof-verification/:customerId/send-email         (admin)  email the (always-available) upload link
+ *   POST /api/v1/sof-verification/:customerId/documents          (admin)  staff upload on the customer's behalf
  *   PATCH /api/v1/sof-verification/:customerId/documents/:docId  (admin)  manual verify/reject override
  *   GET  /api/v1/sof-verification/validate                       (public) look up the customer before showing the upload UI
  *   POST /api/v1/sof-verification/upload                         (public) upload + auto-verify one document
@@ -296,6 +297,107 @@ const renderSofQr = async (url) => {
   }
 };
 
+/** Human-readable result message shared by every upload/re-run response. */
+const sofStatusMessage = (status) =>
+  status === "verified"
+    ? "Document verified"
+    : status === "rejected"
+      ? "Document could not be verified"
+      : "Document uploaded — pending review";
+
+/**
+ * The one SOF upload pipeline, used by both the public QR upload and the
+ * staff upload from the dashboard, so the two can never drift apart:
+ *
+ *   1. OCR first, storage second. A document OCR positively rejects (not a
+ *      valid bank document) is junk and never reaches the file server or the
+ *      customer's document register. An OCR *outage* is different — the doc
+ *      may well be valid, so it is stored as needs_review and can be re-run
+ *      later via reprocessSofDocument.
+ *   2. Store the file in FileVault (skipped for rejected docs).
+ *   3. Append the entry to the SOF session and recompute the session status.
+ *   4. Mirror the stored file into Customer.documents (the Documents tab).
+ *
+ * Throws an ErrorResponse (502) if the file store fails — callers pass it to
+ * next(). `sourceType` tags where the upload came from ("sof_qr_upload" for the
+ * customer, "sof_staff_upload" for a reviewer); `uploadedBy` is the staff user
+ * for a staff upload, null for the public flow.
+ */
+const processSofUpload = async ({ customer, file, docType, sourceType, uploadedBy = null }) => {
+  const sof = await ensureSofSession(customer);
+  const { buffer, originalname, mimetype } = file;
+
+  // 1. OCR
+  let ocrResult = null;
+  let ocrError = null;
+  try {
+    ocrResult = await ocrService.processBankDocument(buffer, originalname, mimetype, docType);
+  } catch (err) {
+    ocrError = err.message;
+    console.error("[processSofUpload] OCR failed:", err.message);
+  }
+
+  let status = "needs_review";
+  if (ocrResult?.success === true) {
+    status = ocrResult.is_valid ? "verified" : "rejected";
+  }
+
+  // 2. Store the file (not for rejected docs)
+  let publicUrl = null;
+  if (status !== "rejected") {
+    try {
+      const uploadRes = await fileVaultService.uploadFile(buffer, originalname, mimetype);
+      publicUrl = uploadRes?.file?.publicUrl;
+      if (!uploadRes?.success || !publicUrl) {
+        throw new Error(uploadRes?.message || "Upload failed");
+      }
+    } catch (err) {
+      throw new ErrorResponse(`File upload failed: ${err.message}`, 502);
+    }
+  }
+
+  // 3. Record on the SOF session
+  sof.documents.push({
+    docType,
+    type: sourceType,
+    name: originalname,
+    // null for rejected docs — the attempt (and why) is still recorded via
+    // the OCR block below, there's just no stored file behind it.
+    url: publicUrl,
+    mimeType: mimetype,
+    status,
+    ocr: buildSofOcrRecord(ocrResult, { docType, ocrError }),
+    uploadedBy,
+    uploadedAt: new Date(),
+  });
+  sof.status = sof.documents.some((d) => d.status === "verified") ? "verified" : "in_review";
+  await sof.save();
+
+  // 4. Mirror into Customer.documents (DocumentMetaSchema) — same store the
+  // reviewer Documents tab reads. updateOne + $push avoids re-running the
+  // Customer pre-save encryption hooks over untouched PII fields. Rejected
+  // docs have no stored file, so there is nothing to mirror.
+  if (publicUrl) {
+    await Customer.updateOne(
+      { _id: customer._id },
+      {
+        $push: {
+          documents: {
+            name: originalname,
+            url: publicUrl,
+            mimeType: mimetype,
+            type: sourceType,
+            docType,
+            uploadedAt: new Date(),
+          },
+        },
+      },
+    );
+  }
+
+  return { sof, status, savedDoc: sof.documents[sof.documents.length - 1] };
+};
+
 // ── Admin: read (auto-create) the session ─────────────────────────────────────
 
 // @desc   Get (or lazily create) the SOF verification session + QR + documents
@@ -508,6 +610,51 @@ exports.reprocessSofDocument = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc   Staff upload of a SOF document on the customer's behalf — e.g. the
+//         customer emailed a statement or handed it over in branch. Runs the
+//         exact same OCR + storage pipeline as the customer's QR upload.
+// @route  POST /api/v1/sof-verification/:customerId/documents
+//         (multipart/form-data: docType, file, caseId?)
+// @access Private (CUSTOMER.EDIT)
+exports.uploadSofDocumentAsStaff = asyncHandler(async (req, res, next) => {
+  const customer = await loadGuardedCustomer(req, next);
+  if (!customer) return;
+
+  const { docType, caseId } = req.body || {};
+  if (!DOC_TYPES.includes(docType)) {
+    return next(new ErrorResponse(`docType must be one of: ${DOC_TYPES.join(", ")}`, 400));
+  }
+  if (!req.file) return next(new ErrorResponse("Please attach a file", 400));
+
+  let result;
+  try {
+    result = await processSofUpload({
+      customer,
+      file: req.file,
+      docType,
+      sourceType: "sof_staff_upload",
+      uploadedBy: req.user?._id || null,
+    });
+  } catch (err) {
+    return next(err);
+  }
+  const { sof, status } = result;
+
+  logEvent({
+    req,
+    service: "kyc",
+    action: "sof_document_uploaded",
+    customer: customer._id,
+    details:
+      `SOF ${docType} uploaded by staff — ${status}` +
+      (caseId ? ` (case ${caseId})` : ""),
+  });
+
+  // Authenticated reviewer response — return the full session, same as the
+  // review/reprocess endpoints, so the panel can just replace its state.
+  res.status(201).json({ success: true, message: sofStatusMessage(status), data: sof });
+});
+
 // ── Public: no-login mobile upload flow ───────────────────────────────────────
 
 // @desc   Look up a customer before showing the mobile upload page
@@ -571,80 +718,18 @@ exports.uploadSofDocument = asyncHandler(async (req, res, next) => {
   const customer = await Customer.findById(cid).select("relations");
   if (!customer) return next(new ErrorResponse("Customer not found", 404));
 
-  const sof = await ensureSofSession(customer);
-
-  const { buffer, originalname, mimetype } = req.file;
-
-  // OCR first, storage second: a document OCR positively rejects (not a valid
-  // bank document) is junk and never reaches the file server or the customer's
-  // document register. An OCR *outage* is different — the doc may well be
-  // valid, so it is stored as needs_review and can be re-run later via
-  // reprocessSofDocument.
-  let ocrResult = null;
-  let ocrError = null;
+  let result;
   try {
-    ocrResult = await ocrService.processBankDocument(buffer, originalname, mimetype, docType);
+    result = await processSofUpload({
+      customer,
+      file: req.file,
+      docType,
+      sourceType: "sof_qr_upload",
+    });
   } catch (err) {
-    ocrError = err.message;
-    console.error("[uploadSofDocument] OCR failed:", err.message);
+    return next(err);
   }
-
-  let status = "needs_review";
-  if (ocrResult?.success === true) {
-    status = ocrResult.is_valid ? "verified" : "rejected";
-  }
-
-  let publicUrl = null;
-  if (status !== "rejected") {
-    try {
-      const uploadRes = await fileVaultService.uploadFile(buffer, originalname, mimetype);
-      publicUrl = uploadRes?.file?.publicUrl;
-      if (!uploadRes?.success || !publicUrl) {
-        throw new Error(uploadRes?.message || "Upload failed");
-      }
-    } catch (err) {
-      return next(new ErrorResponse(`File upload failed: ${err.message}`, 502));
-    }
-  }
-
-  const docEntry = {
-    docType,
-    type: "sof_qr_upload",
-    name: originalname,
-    // null for rejected docs — the attempt (and why) is still recorded via
-    // the OCR block below, there's just no stored file behind it.
-    url: publicUrl,
-    mimeType: mimetype,
-    status,
-    ocr: buildSofOcrRecord(ocrResult, { docType, ocrError }),
-    uploadedAt: new Date(),
-  };
-
-  sof.documents.push(docEntry);
-  sof.status = sof.documents.some((d) => d.status === "verified") ? "verified" : "in_review";
-  await sof.save();
-
-  // Mirror into Customer.documents (DocumentMetaSchema) — same store the
-  // reviewer Documents tab reads. updateOne + $push avoids re-running the
-  // Customer pre-save encryption hooks over untouched PII fields. Rejected
-  // docs have no stored file, so there is nothing to mirror.
-  if (publicUrl) {
-    await Customer.updateOne(
-      { _id: cid },
-      {
-        $push: {
-          documents: {
-            name: originalname,
-            url: publicUrl,
-            mimeType: mimetype,
-            type: "sof_qr_upload",
-            docType,
-            uploadedAt: new Date(),
-          },
-        },
-      },
-    );
-  }
+  const { sof, status, savedDoc } = result;
 
   // Public route — req.user is undefined; logEvent/recordDevice leave actor null.
   logEvent({
@@ -656,19 +741,12 @@ exports.uploadSofDocument = asyncHandler(async (req, res, next) => {
   });
   recordDevice({ req, customerId: cid, purpose: "other", details: { event: "sof_upload", docType } });
 
-  const savedDoc = sof.documents[sof.documents.length - 1];
-
   // Public, unauthenticated response — return only what the upload page shows.
   // The rest of the OCR record (analysis, transactions, raw) is internal
   // compliance commentary and stays on the reviewer side.
   res.status(201).json({
     success: true,
-    message:
-      status === "verified"
-        ? "Document verified"
-        : status === "rejected"
-          ? "Document could not be verified"
-          : "Document uploaded — pending review",
+    message: sofStatusMessage(status),
     data: {
       document: {
         _id: savedDoc._id,

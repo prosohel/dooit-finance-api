@@ -62,8 +62,12 @@ cloudinary.config({
 });
 ///File Upload
 // app.use(upload({ useTempFiles: true }));
-//Make static path to access publicly
-app.use(express.static(path.join(__dirname, "public")));
+//Make static path to access publicly. API paths never serve a file, so they skip the
+//static handler: on Windows a stat() on a deep, non-existent path such as
+//public/api/v1/exchange/events sometimes fails with an unknown system error
+//instead of ENOENT, and express.static then answers 500 for a route that exists.
+const serveStatic = express.static(path.join(__dirname, "public"));
+app.use((req, res, next) => (req.path.startsWith("/api/") ? next() : serveStatic(req, res, next)));
 
 // To Sanitize Data
 

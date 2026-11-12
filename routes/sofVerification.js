@@ -10,6 +10,7 @@ const {
   sendSofEmail,
   reviewSofDocument,
   reprocessSofDocument,
+  uploadSofDocumentAsStaff,
   validateSofCustomer,
   uploadSofDocument,
 } = require("../controllers/sofVerificationController");
@@ -45,6 +46,15 @@ router.post(
   protect,
   authorizePermission("CUSTOMER.EDIT"),
   sendSofEmail,
+);
+// Staff upload on the customer's behalf. Auth runs before multer so an
+// unauthenticated request is refused before its file is buffered.
+router.post(
+  "/:customerId/documents",
+  protect,
+  authorizePermission("CUSTOMER.EDIT"),
+  upload.single("file"),
+  uploadSofDocumentAsStaff,
 );
 router.patch(
   "/:customerId/documents/:docId",

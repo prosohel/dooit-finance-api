@@ -80,10 +80,11 @@ router.route("/").get(
       { path: "relations.client", select: "name" },
       { path: "relations.branch", select: "name" },
     ],
+    // Plain Mongo regex fields only. `user` is a ref (ObjectId) on Customer, so
+    // "user.name" can't be queried here — the linked user's name is matched
+    // by findIdsByDecryptedKyc inside the middleware instead.
     searchFields: [
       "uid",
-      "user.name",
-      "user.email",
       "personalKyc.personal_form.customer_details.given_name",
       "personalKyc.personal_form.customer_details.surname",
     ],

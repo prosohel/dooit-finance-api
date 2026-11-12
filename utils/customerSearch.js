@@ -93,8 +93,18 @@ const KYC_SEARCH_PATHS = [
 ].join(' ');
 
 /**
- * _ids of the customers matching `filter` whose KYC full name and/or email
- * contains `text` (case-insensitive), compared on decrypted values.
+ * _ids of the customers matching `filter` whose name and/or KYC email matches
+ * `text` (case-insensitive), compared on decrypted values.
+ *
+ * Name matching covers BOTH names the queue can display (see the UI's
+ * getCustomerIdentity): the KYC full name (given + middle + surname) and the
+ * linked portal user's name (Users.name, also encrypted at rest). The UI shows
+ * the user's name first, so searching only the KYC fields missed every
+ * customer whose account name differs from their KYC name.
+ *
+ * Names match word by word: every word typed must appear somewhere in the
+ * name, so "john smith" finds "John Andrew Smith". Email still matches the
+ * typed text as one substring.
  *
  * For the queue list + Excel export: they regex the KYC columns in Mongo, which
  * only ever matches plaintext rows. The caller ORs these ids into that regex
@@ -105,29 +115,51 @@ const KYC_SEARCH_PATHS = [
  * @param {object}  filter              Mongoose filter (tenant scope + other filters)
  * @param {string}  text                search text
  * @param {object}  [opts]
- * @param {boolean} [opts.name=true]    match the full name
+ * @param {boolean} [opts.name=true]    match the KYC full name + linked user name
  * @param {boolean} [opts.email=true]   match the KYC email
  * @returns {Promise<ObjectId[]>}
  */
 async function findIdsByDecryptedKyc(filter, text, { name = true, email = true } = {}) {
   const needle = String(text || '').trim().toLowerCase();
   if (!needle) return [];
+  const words = needle.split(/\s+/);
 
   // Mongoose (not the raw collection) so string ids in `filter` are cast.
   // dec() handles both shapes: ciphertext, or values the read hook has
   // already decrypted.
-  const docs = await Customer.find(filter).select(KYC_SEARCH_PATHS).lean();
+  const docs = await Customer.find(filter).select(`${KYC_SEARCH_PATHS} user`).lean();
+
+  // Linked portal users' names, looked up in one query. Model fetched lazily
+  // by name to avoid a require cycle with models/User.
+  const userNameById = new Map();
+  if (name) {
+    const userIds = docs.map((c) => c.user).filter(Boolean);
+    if (userIds.length) {
+      const users = await mongoose.model('Users').find({ _id: { $in: userIds } }).select('name').lean();
+      for (const u of users) userNameById.set(String(u._id), dec(u.name));
+    }
+  }
+
+  const nameMatches = (fullName) => {
+    const lower = fullName.toLowerCase();
+    return Boolean(lower) && words.every((w) => lower.includes(w));
+  };
 
   const ids = [];
   for (const c of docs) {
     const det = c.personalKyc?.personal_form?.customer_details || {};
     const contact = c.personalKyc?.personal_form?.contact_details || {};
-    const hay = [];
+
+    let matched = false;
     if (name) {
-      hay.push([dec(det.given_name), dec(det.middle_name), dec(det.surname)].filter(Boolean).join(' '));
+      const kycName = [dec(det.given_name), dec(det.middle_name), dec(det.surname)].filter(Boolean).join(' ');
+      const userName = c.user ? userNameById.get(String(c.user)) || '' : '';
+      matched = nameMatches(kycName) || nameMatches(userName);
     }
-    if (email) hay.push(dec(contact.email));
-    if (hay.some((h) => h.toLowerCase().includes(needle))) ids.push(c._id);
+    if (!matched && email) {
+      matched = dec(contact.email).toLowerCase().includes(needle);
+    }
+    if (matched) ids.push(c._id);
   }
   return ids;
 }
